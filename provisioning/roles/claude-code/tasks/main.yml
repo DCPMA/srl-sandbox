@@ -1,0 +1,26 @@
+---
+- name: Install Claude Code CLI globally via npm
+  become_user: "{{ sandbox_user }}"
+  shell: |
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    npm install -g @anthropic-ai/claude-code
+  args:
+    executable: /bin/bash
+  register: claude_install
+  changed_when: "'added' in claude_install.stdout or 'updated' in claude_install.stdout"
+
+- name: Verify Claude Code installation
+  become_user: "{{ sandbox_user }}"
+  shell: |
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    claude --version
+  args:
+    executable: /bin/bash
+  changed_when: false
+  register: claude_version
+
+- name: Print Claude Code version
+  debug:
+    msg: "Claude Code version: {{ claude_version.stdout }}"

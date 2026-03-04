@@ -1,0 +1,84 @@
+#compdef srl-sandbox
+# Zsh tab-completion for srl-sandbox
+
+_srl_sandbox_names() {
+    local -a names
+    local dir="$HOME/.config/srl-sandbox/sandboxes"
+    if [[ -d "$dir" ]]; then
+        names=("${(@f)$(ls "$dir"/*.json 2>/dev/null | xargs -I{} basename {} .json)}")
+    fi
+    _describe 'sandbox name' names
+}
+
+_srl_sandbox_names_or_all() {
+    local -a completions
+    completions=("all:All sandboxes")
+    local dir="$HOME/.config/srl-sandbox/sandboxes"
+    if [[ -d "$dir" ]]; then
+        local f
+        for f in "$dir"/*.json(N); do
+            local name=$(basename "$f" .json)
+            completions+=("$name:Sandbox $name")
+        done
+    fi
+    _describe 'sandbox name' completions
+}
+
+_srl-sandbox() {
+    local -a commands
+    commands=(
+        'launch:Create or resume sandbox for project directory'
+        'stop:Stop a sandbox'
+        'suspend:Suspend sandbox (preserves RAM state)'
+        'destroy:Delete sandbox VM and state'
+        'list:List all sandboxes with status'
+        'ssh:SSH into running sandbox'
+        'exec:Run command in sandbox'
+        'provision:Set up base VM template via Ansible'
+        'sync:Re-sync settings and symlinks'
+        'info:Show sandbox details'
+        'help:Show help text'
+        'version:Show version'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        stop|suspend)
+            if (( CURRENT == 3 )); then
+                _srl_sandbox_names_or_all
+            fi
+            ;;
+        destroy|ssh|sync|info)
+            if (( CURRENT == 3 )); then
+                _srl_sandbox_names
+            fi
+            ;;
+        exec)
+            if (( CURRENT == 3 )); then
+                _srl_sandbox_names
+            elif (( CURRENT >= 4 )); then
+                _command_names
+            fi
+            ;;
+        launch)
+            _arguments \
+                '--name[Override sandbox name]:name:' \
+                '--cpus[CPU cores]:cores:(1 2 4 8)' \
+                '--mem[RAM in MB]:memory:(2048 4096 8192 16384)' \
+                '--no-claude[Do not auto-launch Claude Code]' \
+                '--no-sync[Skip settings sync]' \
+                '--headless[Do not open terminal]' \
+                '*:project path:_directories'
+            ;;
+        provision)
+            _arguments \
+                '--from[Source VM to clone]:vm name:'
+            ;;
+    esac
+}
+
+_srl-sandbox "$@"

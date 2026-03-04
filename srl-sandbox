@@ -1,0 +1,1151 @@
+#!/usr/bin/env zsh
+# srl-sandbox — Lightweight Parallels VM Launcher for Claude Code
+# Spins up isolated sandboxes so Claude Code can run with --dangerously-skip-permissions
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly PRLCTL="/usr/local/bin/prlctl"
+readonly CONFIG_DIR="$HOME/.config/srl-sandbox"
+readonly SANDBOXES_DIR="$CONFIG_DIR/sandboxes"
+readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly SSH_TIMEOUT=120
+readonly DEFAULT_CPUS=2
+readonly DEFAULT_MEM=4096
+readonly DEFAULT_USER="parallels"
+readonly KEYCHAIN_SERVICE="srl-sandbox"
+readonly KEYCHAIN_ACCOUNT="vm-password"
+readonly SCRIPT_DIR="${0:A:h}"
+
+# Colors (ANSI-C quoting so escapes are interpreted at assignment)
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[1;33m'
+readonly BLUE=$'\033[0;34m'
+readonly CYAN=$'\033[0;36m'
+readonly MAGENTA=$'\033[0;35m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly NC=$'\033[0m'
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+msg()     { printf "${GREEN}  ▸${NC} %s\n" "$*" }
+info()    { printf "${BLUE}  ℹ${NC} %s\n" "$*" }
+warn()    { printf "${YELLOW}  ⚠${NC} %s\n" "$*" >&2 }
+err()     { printf "${RED}  ✖${NC} %s\n" "$*" >&2 }
+die()     { err "$@"; exit 1 }
+bold()    { printf "${BOLD}%s${NC}" "$*" }
+header()  { printf "\n${BOLD}${CYAN}━━ %s ━━${NC}\n" "$*" }
+success() { printf "${GREEN}  ✔${NC} %s\n" "$*" }
+step()    { printf "${DIM}  ·${NC} %s\n" "$*" }
+
+spin() {
+    local pid=$1 msg=$2
+    local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r${CYAN}%s${NC} %s" "${chars:$((i % ${#chars})):1}" "$msg"
+        sleep 0.1
+        i=$((i + 1))
+    done
+    printf "\r"
+}
+
+confirm() {
+    local prompt="${1:-Are you sure?}"
+    printf "${YELLOW}%s${NC} [y/N] " "$prompt"
+    read -r reply
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+json_get() {
+    local file="$1" key="$2"
+    python3 -c "import json,sys; d=json.load(open('$file')); print(d.get('$key',''))" 2>/dev/null
+}
+
+json_set() {
+    local file="$1" key="$2" val="$3"
+    python3 -c "
+import json,sys
+try:
+    d=json.load(open('$file'))
+except:
+    d={}
+d['$key']=$val
+json.dump(d,open('$file','w'),indent=2)
+"
+}
+
+# ── Keychain ─────────────────────────────────────────────────────────────────
+
+keychain_set() {
+    local password="$1"
+    # Delete existing entry if present (ignore errors)
+    security delete-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
+    # Add new entry
+    security add-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" \
+        -w "$password" \
+        -T "" \
+        2>/dev/null || die "Failed to store password in Keychain"
+    msg "Password stored in macOS Keychain (service: $KEYCHAIN_SERVICE)"
+}
+
+keychain_get() {
+    security find-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" \
+        -w 2>/dev/null
+}
+
+keychain_has() {
+    keychain_get &>/dev/null
+}
+
+prompt_and_store_password() {
+    local password=""
+    if keychain_has; then
+        local existing=$(keychain_get)
+        info "Found existing VM password in Keychain."
+        if ! confirm "Use existing password? (N to enter a new one)"; then
+            printf "${CYAN}Enter VM password for user '%s': ${NC}" "$DEFAULT_USER"
+            read -rs password
+            echo ""
+            [[ -z "$password" ]] && die "Password cannot be empty"
+            keychain_set "$password"
+        fi
+    else
+        printf "${CYAN}Enter VM password for user '%s': ${NC}" "$DEFAULT_USER"
+        read -rs password
+        echo ""
+        [[ -z "$password" ]] && die "Password cannot be empty"
+        keychain_set "$password"
+    fi
+}
+
+# Find host SSH public key
+find_ssh_pubkey() {
+    local key_types=("id_ed25519" "id_rsa" "id_ecdsa")
+    for kt in "${key_types[@]}"; do
+        local kf="$HOME/.ssh/${kt}.pub"
+        if [[ -f "$kf" ]]; then
+            echo "$kf"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# SSH with keychain password fallback (uses SSH_ASKPASS if key auth fails)
+ssh_with_auth() {
+    local user="$1" ip="$2"; shift 2
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+    # Try key-based auth first (will succeed silently if key is in authorized_keys)
+    if ssh -o BatchMode=yes "${ssh_opts[@]}" -o ConnectTimeout=5 \
+           "${user}@${ip}" true 2>/dev/null; then
+        ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@"
+        return $?
+    fi
+
+    # Fall back to SSH_ASKPASS + Keychain password
+    if keychain_has; then
+        local askpass_script
+        askpass_script=$(mktemp "${TMPDIR:-/tmp}/srl-askpass.XXXXXX")
+        cat > "$askpass_script" <<'ASKPASS'
+#!/bin/sh
+security find-generic-password -s "srl-sandbox" -a "vm-password" -w 2>/dev/null
+ASKPASS
+        chmod +x "$askpass_script"
+        local rc=0
+        SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+            ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@" || rc=$?
+        rm -f "$askpass_script"
+        return $rc
+    fi
+
+    # Last resort: interactive SSH
+    ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@"
+}
+
+# Check if browsers have macOS Local Network permission (needed to reach VM IPs)
+check_local_network_access() {
+    local ip="$1"
+    # Quick connectivity test from a non-CLI context isn't possible,
+    # so we check if the user has been warned before
+    local marker="$CONFIG_DIR/.local-network-checked"
+    if [[ ! -f "$marker" ]]; then
+        echo ""
+        info "${BOLD}First-time setup:${NC} Your browser needs macOS Local Network permission"
+        info "to reach the VM at ${ip}."
+        echo ""
+        info "If the URL doesn't load in Chrome/Safari/Firefox:"
+        info "  1. Open ${BOLD}System Settings > Privacy & Security > Local Network${NC}"
+        info "  2. Toggle ${BOLD}ON${NC} for your browser"
+        info "  3. Restart the browser and try again"
+        echo ""
+        touch "$marker"
+    fi
+}
+
+# Start code-server inside the VM and wait for it to be reachable
+# Usage: start_code_server <ip> [folder_path]
+start_code_server() {
+    local ip="$1"
+    local folder="${2:-}"
+    info "Starting code-server..."
+
+    # Try restart (handles both not-running and already-running cases)
+    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+        "sudo systemctl restart code-server@parallels" 2>/dev/null || {
+        # Fallback: try start if restart fails
+        ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+            "sudo systemctl start code-server@parallels" 2>/dev/null || true
+    }
+
+    local elapsed=0
+    local timeout=30
+    while (( elapsed < timeout )); do
+        if nc -z -G 2 "$ip" 8080 &>/dev/null; then
+            local url="http://${ip}:8080"
+            [[ -n "$folder" ]] && url="${url}/?folder=${folder}"
+            msg "Code Server: ${BOLD}${url}${NC}"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+        printf "\r${CYAN}⏳${NC} Waiting for code-server... %ds / %ds" "$elapsed" "$timeout"
+    done
+    printf "\n"
+    warn "code-server not reachable after ${timeout}s"
+    # Print diagnostic info
+    info "Checking code-server status in VM..."
+    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+        "sudo systemctl status code-server@parallels --no-pager 2>&1 | tail -5" 2>/dev/null || true
+}
+
+# ── Init ─────────────────────────────────────────────────────────────────────
+
+init_config() {
+    mkdir -p "$SANDBOXES_DIR"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<'JSON'
+{
+  "base_vm": "",
+  "default_cpus": 2,
+  "default_mem": 4096,
+  "default_user": "parallels",
+  "source_vm": "Debian GNU Linux 12.11 ARM64"
+}
+JSON
+        info "Created config at $CONFIG_FILE"
+    fi
+}
+
+check_parallels() {
+    if [[ ! -x "$PRLCTL" ]]; then
+        die "prlctl not found at $PRLCTL. Is Parallels Desktop installed?"
+    fi
+    if ! pgrep -q "prl_client_app\|prl_disp_service" 2>/dev/null; then
+        warn "Parallels Desktop may not be running. Commands might fail."
+    fi
+}
+
+# ── Naming ───────────────────────────────────────────────────────────────────
+
+derive_name() {
+    local dir_path="$1"
+    local abs_path=$(cd "$dir_path" 2>/dev/null && pwd -P) || die "Invalid path: $dir_path"
+    local dirname=$(basename "$abs_path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+    local hash=$(echo -n "$abs_path" | shasum -a 1 | cut -c1-4)
+    echo "srl-${dirname}-${hash}"
+}
+
+base_name() {
+    local source="$1"
+    local ts=$(date +%s)
+    local hash=$(echo -n "${source}${ts}" | shasum -a 1 | cut -c1-4)
+    echo "srl-base-${hash}"
+}
+
+# ── VM Helpers ───────────────────────────────────────────────────────────────
+
+vm_exists() {
+    $PRLCTL list -a --no-header -o name 2>/dev/null | grep -qx "$1"
+}
+
+vm_status() {
+    $PRLCTL list -a --no-header -o status,name 2>/dev/null | grep " $1$" | awk '{print $1}'
+}
+
+vm_ip() {
+    local name="$1"
+    local ip=""
+    # Try prlctl exec first (requires Parallels Tools)
+    ip=$($PRLCTL exec "$name" -- hostname -I 2>/dev/null | awk '{print $1}') || true
+    if [[ -z "$ip" ]]; then
+        # Fallback: Parallels JSON API (works without guest tools)
+        ip=$($PRLCTL list -f -j 2>/dev/null | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for vm in data:
+    if vm.get('name')=='$name':
+        print(vm.get('ip_configured',''))
+        break
+" 2>/dev/null) || true
+    fi
+    echo "$ip"
+}
+
+wait_ssh() {
+    local name="$1"
+    local timeout="${2:-$SSH_TIMEOUT}"
+    local elapsed=0
+    info "Waiting for VM to become reachable (timeout: ${timeout}s)..."
+    while (( elapsed < timeout )); do
+        # Try prlctl exec first (requires Parallels Tools in guest)
+        if $PRLCTL exec "$name" -- echo "ready" &>/dev/null; then
+            msg "VM is ready (via prlctl exec)"
+            return 0
+        fi
+        # Fallback: check if SSH port is open via IP from Parallels JSON API
+        local ip
+        ip=$($PRLCTL list -f -j 2>/dev/null | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for vm in data:
+    if vm.get('name')=='$name':
+        v=vm.get('ip_configured','')
+        if v and v!='-' and not v.startswith('fe80'):
+            print(v)
+        break
+" 2>/dev/null) || true
+        if [[ -n "$ip" ]] && nc -z -G 2 "$ip" 22 &>/dev/null; then
+            msg "VM is ready (SSH port open at $ip)"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        printf "\r${CYAN}⏳${NC} %ds / %ds" "$elapsed" "$timeout"
+    done
+    printf "\n"
+    die "SSH timeout after ${timeout}s. VM may still be booting."
+}
+
+get_base_vm() {
+    local base=$(json_get "$CONFIG_FILE" "base_vm")
+    if [[ -z "$base" ]] || ! vm_exists "$base"; then
+        echo ""
+        warn "No base VM found. A provisioned base image is required to create sandboxes."
+        echo ""
+        if confirm "Would you like to provision a base image now?"; then
+            local source=$(json_get "$CONFIG_FILE" "source_vm")
+            if [[ -n "$source" ]] && vm_exists "$source"; then
+                info "Source VM from config: ${BOLD}${source}${NC}"
+                if confirm "Use '${source}' as the source?"; then
+                    cmd_provision --from "$source"
+                else
+                    # List available VMs for the user to choose
+                    echo ""
+                    info "Available VMs:"
+                    local vms=()
+                    while IFS= read -r vm_name; do
+                        vms+=("$vm_name")
+                    done < <($PRLCTL list -a --no-header -o name 2>/dev/null | grep -v '^srl-')
+                    local i=1
+                    for vm_name in "${vms[@]}"; do
+                        printf "  ${CYAN}%d)${NC} %s\n" "$i" "$vm_name"
+                        i=$((i + 1))
+                    done
+                    echo ""
+                    printf "${CYAN}Select source VM [1-%d]: ${NC}" "${#vms[@]}"
+                    read -r choice
+                    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#vms[@]} )); then
+                        cmd_provision --from "${vms[$choice]}"
+                    else
+                        die "Invalid selection."
+                    fi
+                fi
+            else
+                # No configured source — list all non-srl VMs
+                echo ""
+                info "Available VMs to use as source:"
+                local vms=()
+                while IFS= read -r vm_name; do
+                    vms+=("$vm_name")
+                done < <($PRLCTL list -a --no-header -o name 2>/dev/null | grep -v '^srl-')
+                if [[ ${#vms[@]} -eq 0 ]]; then
+                    die "No VMs found in Parallels. Create a Debian/Ubuntu VM first."
+                fi
+                local i=1
+                for vm_name in "${vms[@]}"; do
+                    printf "  ${CYAN}%d)${NC} %s\n" "$i" "$vm_name"
+                    i=$((i + 1))
+                done
+                echo ""
+                printf "${CYAN}Select source VM [1-%d]: ${NC}" "${#vms[@]}"
+                read -r choice
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#vms[@]} )); then
+                    cmd_provision --from "${vms[$choice]}"
+                else
+                    die "Invalid selection."
+                fi
+            fi
+            # Re-read base VM after provisioning
+            base=$(json_get "$CONFIG_FILE" "base_vm")
+            if [[ -z "$base" ]] || ! vm_exists "$base"; then
+                die "Provisioning completed but base VM not found. Check provisioning output."
+            fi
+        else
+            die "Cannot create sandbox without a base VM. Run 'srl-sandbox provision' first."
+        fi
+    fi
+    echo "$base"
+}
+
+sandbox_state_file() {
+    echo "$SANDBOXES_DIR/$1.json"
+}
+
+save_sandbox_state() {
+    local name="$1" proj_path="$2" cpus="$3" mem="$4"
+    cat > "$(sandbox_state_file "$name")" <<JSON
+{
+  "name": "$name",
+  "project_path": "$proj_path",
+  "cpus": $cpus,
+  "mem": $mem,
+  "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+}
+
+list_sandbox_names() {
+    local f
+    for f in "$SANDBOXES_DIR"/*.json(N); do
+        basename "$f" .json
+    done
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_provision() {
+    local source_vm=""
+    local from_flag=""
+
+    # Parse provision args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) source_vm="$2"; shift 2 ;;
+            *) die "Unknown provision option: $1" ;;
+        esac
+    done
+
+    if [[ -z "$source_vm" ]]; then
+        source_vm=$(json_get "$CONFIG_FILE" "source_vm")
+    fi
+    [[ -z "$source_vm" ]] && die "No source VM specified. Use --from <name> or set source_vm in config."
+
+    if ! vm_exists "$source_vm"; then
+        die "Source VM '$source_vm' not found. Available VMs:"
+        $PRLCTL list -a --no-header -o name
+    fi
+
+    # Check for ansible
+    if ! command -v ansible-playbook &>/dev/null; then
+        die "Ansible not found. Install with: brew install ansible"
+    fi
+
+    # Prompt for VM password and store in Keychain
+    prompt_and_store_password
+    local vm_password=$(keychain_get)
+    [[ -z "$vm_password" ]] && die "Could not retrieve password from Keychain"
+
+    # Find host SSH public key
+    local ssh_pubkey_file=""
+    local ssh_pubkey=""
+    if ssh_pubkey_file=$(find_ssh_pubkey); then
+        ssh_pubkey=$(cat "$ssh_pubkey_file")
+        info "Found SSH public key: $ssh_pubkey_file"
+    else
+        warn "No SSH public key found (~/.ssh/id_ed25519.pub, id_rsa.pub, etc.)"
+        warn "Password-based auth will be used. Consider running: ssh-keygen -t ed25519"
+    fi
+
+    local base=$(base_name "$source_vm")
+    msg "Provisioning base VM: $base from '$source_vm'"
+
+    # Clone source
+    info "Cloning '$source_vm' -> '$base'..."
+    $PRLCTL clone "$source_vm" --name "$base" || die "Clone failed"
+
+    # Configure networking (shared = NAT, VM can reach internet but not exposed on LAN)
+    info "Setting shared networking..."
+    $PRLCTL set "$base" --device-set net0 --type shared 2>/dev/null || \
+        warn "Could not set shared networking. You may need to configure manually."
+
+    # Start VM
+    info "Starting base VM..."
+    $PRLCTL start "$base" || die "Failed to start VM"
+
+    wait_ssh "$base"
+
+    # Get IP
+    local ip=$(vm_ip "$base")
+    [[ -z "$ip" ]] && die "Could not determine VM IP address"
+    msg "Base VM IP: $ip"
+
+    # Inject SSH public key into VM before Ansible runs
+    if [[ -n "$ssh_pubkey" ]]; then
+        info "Injecting SSH public key into VM..."
+        $PRLCTL exec "$base" -- bash -c "
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            echo '$ssh_pubkey' >> ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+        " 2>/dev/null || warn "SSH key injection via prlctl exec failed, Ansible will use password"
+    fi
+
+    # Generate inventory
+    local inv_file="$CONFIG_DIR/inventory.yml"
+    local prov_dir="$SCRIPT_DIR/provisioning"
+
+    cat > "$inv_file" <<YAML
+all:
+  hosts:
+    base:
+      ansible_host: $ip
+      ansible_user: $DEFAULT_USER
+      ansible_ssh_pass: $vm_password
+      ansible_become_pass: $vm_password
+      ansible_connection: paramiko_ssh
+      ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+YAML
+
+    # Run Ansible (password passed via inventory)
+    # Reset file descriptors to blocking mode — prlctl/nc in wait_ssh can leave
+    # them non-blocking, which Ansible rejects.
+    python3 -c "import fcntl,os;[fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_NONBLOCK) for fd in (0,1,2)]"
+    msg "Running Ansible provisioning..."
+    if [[ -f "$prov_dir/playbook.yml" ]]; then
+        ANSIBLE_HOST_KEY_CHECKING=False \
+        ansible-playbook -i "$inv_file" "$prov_dir/playbook.yml" \
+            || die "Ansible provisioning failed"
+    else
+        die "Playbook not found at $prov_dir/playbook.yml"
+    fi
+
+    # Clean password from inventory file (SSH key is now in place)
+    cat > "$inv_file" <<YAML
+all:
+  hosts:
+    base:
+      ansible_host: $ip
+      ansible_user: $DEFAULT_USER
+      ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+YAML
+    info "Cleaned password from inventory file"
+
+    # Stop VM — ready to clone
+    info "Stopping base VM..."
+    $PRLCTL stop "$base" || warn "Stop may have failed"
+
+    # Save to config
+    json_set "$CONFIG_FILE" "base_vm" "\"$base\""
+
+    msg "Base VM '$base' provisioned and saved. Ready for sandboxes."
+}
+
+cmd_launch() {
+    local proj_path=""
+    local name=""
+    local cpus=$DEFAULT_CPUS
+    local mem=$DEFAULT_MEM
+    local no_claude=false
+    local no_sync=false
+    local headless=false
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)      name="$2"; shift 2 ;;
+            --cpus)      cpus="$2"; shift 2 ;;
+            --mem)       mem="$2"; shift 2 ;;
+            --no-claude) no_claude=true; shift ;;
+            --no-sync)   no_sync=true; shift ;;
+            --headless)  headless=true; shift ;;
+            -*)          die "Unknown option: $1" ;;
+            *)           proj_path="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$proj_path" ]] && proj_path="$(pwd)"
+    proj_path=$(cd "$proj_path" 2>/dev/null && pwd -P) || die "Invalid path: $proj_path"
+    [[ -z "$name" ]] && name=$(derive_name "$proj_path")
+
+    msg "Sandbox: ${BOLD}$name${NC} -> $proj_path"
+
+    if vm_exists "$name"; then
+        local vm_state=$(vm_status "$name")
+        case "$vm_state" in
+            running)
+                info "VM already running"
+                ;;
+            stopped)
+                info "Resuming stopped VM..."
+                $PRLCTL start "$name" || die "Failed to start VM"
+                wait_ssh "$name"
+                ;;
+            suspended)
+                info "Resuming suspended VM..."
+                $PRLCTL resume "$name" || die "Failed to resume VM"
+                wait_ssh "$name"
+                ;;
+            *)
+                warn "VM in unexpected state: $vm_state. Attempting start..."
+                $PRLCTL start "$name" 2>/dev/null || die "Failed to start VM"
+                wait_ssh "$name"
+                ;;
+        esac
+    else
+        # Create new sandbox
+        local base=$(get_base_vm)
+        info "Creating linked clone from $base..."
+        $PRLCTL clone "$base" --name "$name" --linked || die "Clone failed"
+
+        # Configure resources
+        info "Setting resources: ${cpus} CPUs, ${mem}MB RAM"
+        $PRLCTL set "$name" --cpus "$cpus" --memsize "$mem" 2>/dev/null
+
+        # Shared networking (NAT — internet access without LAN exposure)
+        $PRLCTL set "$name" --device-set net0 --type shared 2>/dev/null || true
+
+        # Harden isolation: only explicit shared folders, clipboard, no extras
+        info "Hardening VM isolation..."
+        $PRLCTL set "$name" --smart-mount off 2>/dev/null || true
+        $PRLCTL set "$name" --shared-profile off 2>/dev/null || true
+        $PRLCTL set "$name" --shared-cloud off 2>/dev/null || true
+        $PRLCTL set "$name" --share-host-location off 2>/dev/null || true
+        $PRLCTL set "$name" --shared-clipboard on 2>/dev/null || true
+
+        # Shared folders (project, claude config, aws creds)
+        info "Adding shared folders..."
+        $PRLCTL set "$name" --shf-host-add "project" --path "$proj_path" --mode rw 2>/dev/null || true
+        $PRLCTL set "$name" --shf-host-add "claude" --path "$HOME/.claude" --mode rw 2>/dev/null || true
+        $PRLCTL set "$name" --shf-host-add "aws" --path "$HOME/.aws" --mode rw 2>/dev/null || true
+
+        # Start VM
+        info "Starting sandbox..."
+        $PRLCTL start "$name" || die "Failed to start VM"
+        wait_ssh "$name"
+
+        # Guest-side setup
+        if [[ "$no_sync" != true ]]; then
+            cmd_sync_internal "$name" "$proj_path"
+        fi
+
+        # Save state
+        save_sandbox_state "$name" "$proj_path" "$cpus" "$mem"
+    fi
+
+    # Print info
+    local ip=$(vm_ip "$name")
+    msg "VM IP: ${BOLD}${ip:-unknown}${NC}"
+
+    if [[ "$headless" == true ]]; then
+        # In headless mode, still start code-server silently
+        if [[ -n "$ip" ]]; then
+            start_code_server "$ip" "/media/psf/project"
+        fi
+        info "Headless mode — use 'srl-sandbox ssh $name' to connect"
+        return
+    fi
+
+    # ── Interactive launch menu ──────────────────────────────────────────
+    # Present multi-select options unless flags override
+    local run_code_server=false
+    local run_claude=false
+    local claude_skip_perms=false
+
+    if [[ "$no_claude" == true ]]; then
+        # --no-claude flag: skip the menu, just offer code-server
+        run_code_server=true
+    else
+        echo ""
+        header "Launch Options"
+        printf "  ${DIM}Toggle options with their number, then press Enter to confirm.${NC}\n"
+        echo ""
+
+        # Menu state (all start checked by default)
+        local opt_cs=true
+        local opt_claude=true
+        local opt_skip=true
+
+        while true; do
+            # Render menu
+            local cs_mark claude_mark skip_mark
+            $opt_cs     && cs_mark="${GREEN}✔${NC}" || cs_mark="${DIM}○${NC}"
+            $opt_claude && claude_mark="${GREEN}✔${NC}" || claude_mark="${DIM}○${NC}"
+            $opt_skip   && skip_mark="${GREEN}✔${NC}" || skip_mark="${DIM}○${NC}"
+
+            printf "\r\033[K  %b ${BOLD}1${NC} Code Server          %b ${BOLD}2${NC} Claude Code          %b ${BOLD}3${NC} Skip Permissions\n" \
+                "$cs_mark" "$claude_mark" "$skip_mark"
+            printf "\n  ${CYAN}Toggle [1-3] or press Enter to launch: ${NC}"
+
+            read -r choice
+            # Move cursor up to overwrite the menu for redraw
+            printf "\033[3A"
+
+            case "$choice" in
+                1) $opt_cs && opt_cs=false || opt_cs=true ;;
+                2) $opt_claude && opt_claude=false || opt_claude=true ;;
+                3) $opt_skip && opt_skip=false || opt_skip=true ;;
+                "") 
+                    # Clear the menu area and break
+                    printf "\033[3B"
+                    break
+                    ;;
+                *)
+                    # Unknown input, just redraw
+                    ;;
+            esac
+        done
+
+        run_code_server=$opt_cs
+        run_claude=$opt_claude
+        claude_skip_perms=$opt_skip
+    fi
+
+    # ── Execute selected options ─────────────────────────────────────────
+
+    # Code Server
+    if $run_code_server && [[ -n "$ip" ]]; then
+        start_code_server "$ip" "/media/psf/project"
+        check_local_network_access "$ip"
+    fi
+
+    # Claude Code
+    if $run_claude && [[ -n "$ip" ]]; then
+        if ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+            "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
+            echo ""
+            if $run_code_server; then
+                msg "Code Server: ${BOLD}http://${ip}:8080/?folder=/media/psf/project${NC}"
+            fi
+
+            local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd /media/psf/project && claude"
+            if $claude_skip_perms; then
+                claude_cmd+=" --dangerously-skip-permissions"
+                info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
+            else
+                info "Launching Claude Code..."
+            fi
+            echo ""
+            ssh_with_auth "${DEFAULT_USER}" "${ip}" "$claude_cmd"
+        else
+            warn "Claude Code not found in VM. Falling back to shell."
+            warn "Install with: npm install -g @anthropic-ai/claude-code"
+            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+                "cd /media/psf/project && exec zsh -l"
+        fi
+    elif ! $run_claude && [[ -n "$ip" ]]; then
+        # No Claude selected — open SSH shell
+        ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+            "cd /media/psf/project && exec zsh -l"
+    fi
+}
+
+cmd_sync_internal() {
+    local name="$1"
+    local proj_path="${2:-}"
+
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && { warn "Cannot sync — no IP for $name"; return 1; }
+
+    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+    info "Setting up guest-side symlinks..."
+
+    # Parallels Tools mounts shared folders at /media/psf/
+    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+        'rm -rf ~/.claude 2>/dev/null; ln -sf /media/psf/claude ~/.claude; rm -rf ~/.aws 2>/dev/null; ln -sf /media/psf/aws ~/.aws' \
+        2>/dev/null || warn "Symlink setup may have partially failed"
+
+    # Create macOS-compatible path symlink for project (needs sudo + password)
+    if [[ -n "$proj_path" ]]; then
+        local parent_dir=$(dirname "$proj_path")
+        local vm_pass=""
+        keychain_has && vm_pass=$(keychain_get)
+        if [[ -n "$vm_pass" ]]; then
+            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+                "echo '${vm_pass}' | sudo -S bash -c \"mkdir -p '${parent_dir}' && ln -sf /media/psf/project '${proj_path}' && chown -h ${DEFAULT_USER}:${DEFAULT_USER} '${proj_path}'\"" \
+                2>/dev/null || warn "Project path symlink may have failed"
+        else
+            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+                "sudo mkdir -p '${parent_dir}' && sudo ln -sf /media/psf/project '${proj_path}' && sudo chown -h ${DEFAULT_USER}:${DEFAULT_USER} '${proj_path}'" \
+                2>/dev/null || warn "Project path symlink may have failed (no sudo password)"
+        fi
+    fi
+
+    # ── Git config sync ──────────────────────────────────────────────────
+    info "Syncing Git configuration..."
+    local git_synced=false
+    if [[ -f "$HOME/.gitconfig" ]]; then
+        scp -q "${ssh_opts[@]}" "$HOME/.gitconfig" \
+            "${DEFAULT_USER}@${ip}:~/.gitconfig" 2>/dev/null \
+            && git_synced=true \
+            || warn "Failed to copy .gitconfig"
+    fi
+    if [[ -f "$HOME/.gitconfig.local" ]]; then
+        scp -q "${ssh_opts[@]}" "$HOME/.gitconfig.local" \
+            "${DEFAULT_USER}@${ip}:~/.gitconfig.local" 2>/dev/null \
+            || warn "Failed to copy .gitconfig.local"
+    fi
+    $git_synced && msg "Git config synced"
+
+    # ── VS Code settings sync to code-server ─────────────────────────────
+    local vscode_settings_dir="$HOME/Library/Application Support/Code/User"
+    local cs_user_dir="~/.local/share/code-server/User"
+
+    # Ensure code-server User directory exists on VM
+    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+        "mkdir -p ${cs_user_dir}" 2>/dev/null || true
+
+    local settings_synced=false
+    if [[ -f "${vscode_settings_dir}/settings.json" ]]; then
+        info "Syncing VS Code settings..."
+        scp -q "${ssh_opts[@]}" "${vscode_settings_dir}/settings.json" \
+            "${DEFAULT_USER}@${ip}:${cs_user_dir}/settings.json" 2>/dev/null \
+            && settings_synced=true \
+            || warn "Failed to copy VS Code settings.json"
+    fi
+    if [[ -f "${vscode_settings_dir}/keybindings.json" ]]; then
+        info "Syncing VS Code keybindings..."
+        scp -q "${ssh_opts[@]}" "${vscode_settings_dir}/keybindings.json" \
+            "${DEFAULT_USER}@${ip}:${cs_user_dir}/keybindings.json" 2>/dev/null \
+            && settings_synced=true \
+            || warn "Failed to copy VS Code keybindings.json"
+    fi
+    # Sync snippets directory if it exists
+    if [[ -d "${vscode_settings_dir}/snippets" ]]; then
+        info "Syncing VS Code snippets..."
+        scp -q -r "${ssh_opts[@]}" "${vscode_settings_dir}/snippets" \
+            "${DEFAULT_USER}@${ip}:${cs_user_dir}/" 2>/dev/null \
+            || warn "Failed to copy VS Code snippets"
+    fi
+    $settings_synced && msg "VS Code settings synced to code-server"
+
+    # ── VS Code extensions sync ──────────────────────────────────────────
+    if command -v code &>/dev/null; then
+        info "Syncing VS Code extensions..."
+        local ext_list
+        ext_list=$(code --list-extensions 2>/dev/null)
+        if [[ -n "$ext_list" ]]; then
+            local ext_count=$(echo "$ext_list" | wc -l | tr -d ' ')
+            # Build install command (batch all extensions)
+            local install_cmd="source ~/.nvm/nvm.sh 2>/dev/null; "
+            install_cmd+="echo '${ext_list}' | while IFS= read -r ext; do "
+            install_cmd+="code-server --install-extension \"\$ext\" 2>/dev/null || true; "
+            install_cmd+="done"
+            ssh_with_auth "${DEFAULT_USER}" "${ip}" "$install_cmd" 2>/dev/null \
+                && msg "Installed ${ext_count} VS Code extensions in code-server" \
+                || warn "Some extensions may have failed to install"
+        fi
+    else
+        info "VS Code CLI not found on host — skipping extension sync"
+    fi
+}
+
+cmd_sync() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox sync <name>"
+    local name="$1"
+    vm_exists "$name" || die "Sandbox '$name' not found"
+    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
+
+    local state_file=$(sandbox_state_file "$name")
+    local proj_path=""
+    [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
+
+    cmd_sync_internal "$name" "$proj_path"
+    msg "Sync complete for $name"
+}
+
+cmd_stop() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox stop <name|all>"
+    local target="$1"
+
+    if [[ "$target" == "all" ]]; then
+        local names=($(list_sandbox_names))
+        [[ ${#names[@]} -eq 0 ]] && { info "No sandboxes found."; return; }
+        for n in "${names[@]}"; do
+            if [[ "$(vm_status "$n")" == "running" ]]; then
+                info "Stopping $n..."
+                $PRLCTL stop "$n" 2>/dev/null && msg "Stopped $n" || warn "Failed to stop $n"
+            fi
+        done
+    else
+        vm_exists "$target" || die "Sandbox '$target' not found"
+        info "Stopping $target..."
+        $PRLCTL stop "$target" || die "Failed to stop"
+        msg "Stopped $target"
+    fi
+}
+
+cmd_suspend() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox suspend <name|all>"
+    local target="$1"
+
+    if [[ "$target" == "all" ]]; then
+        local names=($(list_sandbox_names))
+        [[ ${#names[@]} -eq 0 ]] && { info "No sandboxes found."; return; }
+        for n in "${names[@]}"; do
+            if [[ "$(vm_status "$n")" == "running" ]]; then
+                info "Suspending $n..."
+                $PRLCTL suspend "$n" 2>/dev/null && msg "Suspended $n" || warn "Failed to suspend $n"
+            fi
+        done
+    else
+        vm_exists "$target" || die "Sandbox '$target' not found"
+        info "Suspending $target..."
+        $PRLCTL suspend "$target" || die "Failed to suspend"
+        msg "Suspended $target"
+    fi
+}
+
+cmd_destroy() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox destroy <name>"
+    local name="$1"
+
+    vm_exists "$name" || die "Sandbox '$name' not found"
+    confirm "Destroy sandbox '$name'? This cannot be undone." || { info "Cancelled."; return; }
+
+    local vm_state=$(vm_status "$name")
+    if [[ "$vm_state" == "running" || "$vm_state" == "suspended" ]]; then
+        info "Force-stopping VM..."
+        $PRLCTL stop "$name" --kill 2>/dev/null || true
+    fi
+
+    info "Deleting VM..."
+    $PRLCTL delete "$name" || die "Failed to delete VM"
+
+    # Remove state file
+    local state_file=$(sandbox_state_file "$name")
+    [[ -f "$state_file" ]] && rm -f "$state_file"
+
+    msg "Destroyed $name"
+}
+
+cmd_list() {
+    local names=($(list_sandbox_names))
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        info "No sandboxes found."
+        return
+    fi
+
+    header "Sandboxes"
+    printf "  ${BOLD}%-30s  %-10s  %-16s  %s${NC}\n" "NAME" "STATUS" "IP" "PROJECT"
+    printf "  ${DIM}%-30s  %-10s  %-16s  %s${NC}\n" "────────────────────────────" "─────────" "───────────────" "───────────────────────"
+
+    for name in "${names[@]}"; do
+        local vm_state="unknown"
+        local ip="-"
+        local proj_path="-"
+
+        if vm_exists "$name"; then
+            vm_state=$(vm_status "$name")
+            if [[ "$vm_state" == "running" ]]; then
+                ip=$(vm_ip "$name" 2>/dev/null)
+                [[ -z "$ip" ]] && ip="-"
+            fi
+        else
+            vm_state="deleted"
+        fi
+
+        local state_file=$(sandbox_state_file "$name")
+        [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
+        [[ -z "$proj_path" ]] && proj_path="-"
+
+        # Colorize status with fixed-width indicator
+        local status_icon color_status
+        case "$vm_state" in
+            running)   status_icon="${GREEN}●${NC}"; color_status="${GREEN}${vm_state}${NC}" ;;
+            stopped)   status_icon="${RED}●${NC}";   color_status="${RED}${vm_state}${NC}" ;;
+            suspended) status_icon="${YELLOW}●${NC}"; color_status="${YELLOW}${vm_state}${NC}" ;;
+            deleted)   status_icon="${RED}○${NC}";   color_status="${RED}${vm_state}${NC}" ;;
+            *)         status_icon="${DIM}?${NC}";   color_status="$vm_state" ;;
+        esac
+
+        printf "  %-30s  %b %-10b  %-16s  ${DIM}%s${NC}\n" "$name" "$status_icon" "$color_status" "$ip" "$proj_path"
+    done
+    echo ""
+}
+
+cmd_ssh() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox ssh <name>"
+    local name="$1"
+    vm_exists "$name" || die "Sandbox '$name' not found"
+    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
+
+    local ip=$(vm_ip "$name")
+    [[ -z "$ip" ]] && die "Could not determine VM IP"
+
+    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
+        "cd /media/psf/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+}
+
+cmd_exec() {
+    [[ $# -lt 2 ]] && die "Usage: srl-sandbox exec <name> <command...>"
+    local name="$1"; shift
+    vm_exists "$name" || die "Sandbox '$name' not found"
+    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
+
+    $PRLCTL exec "$name" -- "$@"
+}
+
+cmd_info() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox info <name>"
+    local name="$1"
+    vm_exists "$name" || die "Sandbox '$name' not found"
+
+    local vm_state=$(vm_status "$name")
+    local ip="-"
+    [[ "$vm_state" == "running" ]] && ip=$(vm_ip "$name" 2>/dev/null)
+    [[ -z "$ip" ]] && ip="-"
+
+    local state_file=$(sandbox_state_file "$name")
+    local proj_path="-" cpus="-" mem="-" created="-"
+    if [[ -f "$state_file" ]]; then
+        proj_path=$(json_get "$state_file" "project_path")
+        cpus=$(json_get "$state_file" "cpus")
+        mem=$(json_get "$state_file" "mem")
+        created=$(json_get "$state_file" "created")
+    fi
+
+    # Status indicator
+    local status_display
+    case "$vm_state" in
+        running)   status_display="${GREEN}● running${NC}" ;;
+        stopped)   status_display="${RED}● stopped${NC}" ;;
+        suspended) status_display="${YELLOW}● suspended${NC}" ;;
+        *)         status_display="${DIM}? ${vm_state}${NC}" ;;
+    esac
+
+    header "$name"
+    printf "  ${BOLD}%-14s${NC} %b\n" "Status" "$status_display"
+    printf "  ${BOLD}%-14s${NC} %s\n" "IP" "$ip"
+    printf "  ${BOLD}%-14s${NC} %s\n" "Project" "${proj_path:-—}"
+    printf "  ${BOLD}%-14s${NC} %s vCPU · %s MB RAM\n" "Resources" "${cpus:-—}" "${mem:-—}"
+    printf "  ${BOLD}%-14s${NC} %s\n" "Created" "${created:-—}"
+
+    echo ""
+    printf "  ${BOLD}Shared Folders${NC}\n"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "/media/psf/project"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/media/psf/claude"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/media/psf/aws"
+
+    echo ""
+    printf "  ${BOLD}Synced Config${NC}\n"
+    [[ -f "$HOME/.gitconfig" ]] \
+        && printf "  ${DIM}%-12s %s${NC}\n" "git" "~/.gitconfig" \
+        || printf "  ${DIM}%-12s %s${NC}\n" "git" "(not found on host)"
+    [[ -f "$HOME/Library/Application Support/Code/User/settings.json" ]] \
+        && printf "  ${DIM}%-12s %s${NC}\n" "vscode" "settings.json, keybindings.json" \
+        || printf "  ${DIM}%-12s %s${NC}\n" "vscode" "(VS Code settings not found)"
+
+    if [[ "$vm_state" == "running" && "$ip" != "-" ]]; then
+        echo ""
+        printf "  ${BOLD}Quick Access${NC}\n"
+        printf "  ${CYAN}ssh${NC}     ssh %s@%s\n" "$DEFAULT_USER" "$ip"
+        printf "  ${CYAN}http${NC}    http://%s:8080/\n" "$ip"
+        printf "  ${CYAN}claude${NC}  srl-sandbox launch (auto-connects)\n"
+    fi
+    echo ""
+}
+
+cmd_help() {
+    echo ""
+    printf "  ${BOLD}${CYAN}srl-sandbox${NC} ${DIM}v${VERSION}${NC}\n"
+    printf "  ${DIM}Parallels VM sandboxes for Claude Code${NC}\n"
+    echo ""
+    printf "  ${BOLD}Usage${NC}    srl-sandbox ${DIM}[path] [options]${NC}\n"
+    printf "  ${DIM}         Running without arguments launches a sandbox for the current directory.${NC}\n"
+    echo ""
+    printf "  ${BOLD}Commands${NC}\n"
+    printf "    ${CYAN}launch${NC} ${DIM}[path]${NC}           Create or resume sandbox for project dir ${DIM}(default: cwd)${NC}\n"
+    printf "    ${CYAN}stop${NC} ${DIM}<name|all>${NC}         Stop a sandbox\n"
+    printf "    ${CYAN}suspend${NC} ${DIM}<name|all>${NC}      Suspend sandbox ${DIM}(preserves RAM state)${NC}\n"
+    printf "    ${CYAN}destroy${NC} ${DIM}<name>${NC}          Delete sandbox VM and state\n"
+    printf "    ${CYAN}list${NC}                     List all sandboxes with status\n"
+    printf "    ${CYAN}ssh${NC} ${DIM}<name>${NC}              SSH into running sandbox\n"
+    printf "    ${CYAN}exec${NC} ${DIM}<name> <cmd>${NC}       Run command in sandbox\n"
+    printf "    ${CYAN}provision${NC}                Set up base VM template via Ansible\n"
+    printf "    ${CYAN}sync${NC} ${DIM}<name>${NC}             Re-sync settings, configs & extensions\n"
+    printf "    ${CYAN}info${NC} ${DIM}<name>${NC}             Show sandbox details\n"
+    echo ""
+    printf "  ${BOLD}Launch Options${NC}\n"
+    printf "    ${CYAN}--name${NC} ${DIM}<name>${NC}           Override auto-generated name\n"
+    printf "    ${CYAN}--cpus${NC} ${DIM}<n>${NC}              CPU cores ${DIM}(default: $DEFAULT_CPUS)${NC}\n"
+    printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in MB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
+    printf "    ${CYAN}--no-claude${NC}              Don't auto-launch Claude Code\n"
+    printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
+    printf "    ${CYAN}--headless${NC}               Don't open terminal after launch\n"
+    echo ""
+    printf "  ${BOLD}Provision Options${NC}\n"
+    printf "    ${CYAN}--from${NC} ${DIM}<vm-name>${NC}        Source VM to clone ${DIM}(default: from config)${NC}\n"
+    echo ""
+    printf "  ${BOLD}Sync Details${NC}\n"
+    printf "    On launch/sync, the following are copied to the VM:\n"
+    printf "    ${DIM}·${NC} ~/.gitconfig, ~/.gitconfig.local\n"
+    printf "    ${DIM}·${NC} VS Code settings.json, keybindings.json, snippets/\n"
+    printf "    ${DIM}·${NC} VS Code extensions ${DIM}(installed in code-server)${NC}\n"
+    echo ""
+    printf "  ${BOLD}Examples${NC}\n"
+    printf "    ${DIM}\$${NC} srl-sandbox provision --from \"Debian GNU Linux 12.11 ARM64\"\n"
+    printf "    ${DIM}\$${NC} srl-sandbox launch ~/Projects/myapp\n"
+    printf "    ${DIM}\$${NC} srl-sandbox launch --cpus 4 --mem 8192 --headless\n"
+    printf "    ${DIM}\$${NC} srl-sandbox list\n"
+    printf "    ${DIM}\$${NC} srl-sandbox ssh srl-myapp-a1b2\n"
+    printf "    ${DIM}\$${NC} srl-sandbox stop all\n"
+    echo ""
+}
+
+# ── Ctrl+C Trap ──────────────────────────────────────────────────────────────
+
+trap_handler() {
+    echo ""
+    warn "Interrupted. Note: any running VMs are still active."
+    warn "Use 'srl-sandbox list' to see running sandboxes."
+    exit 130
+}
+trap trap_handler INT
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    init_config
+
+    # No arguments → launch sandbox for current directory
+    [[ $# -eq 0 ]] && { check_parallels; cmd_launch; return; }
+
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        launch)    check_parallels; cmd_launch "$@" ;;
+        stop)      check_parallels; cmd_stop "$@" ;;
+        suspend)   check_parallels; cmd_suspend "$@" ;;
+        destroy)   check_parallels; cmd_destroy "$@" ;;
+        list)      check_parallels; cmd_list "$@" ;;
+        ssh)       check_parallels; cmd_ssh "$@" ;;
+        exec)      check_parallels; cmd_exec "$@" ;;
+        provision) check_parallels; cmd_provision "$@" ;;
+        sync)      check_parallels; cmd_sync "$@" ;;
+        info)      check_parallels; cmd_info "$@" ;;
+        help|--help|-h) cmd_help ;;
+        version|--version|-v) echo "srl-sandbox v${VERSION}" ;;
+        -*)        check_parallels; cmd_launch "$cmd" "$@" ;;
+        *)         check_parallels; cmd_launch "$cmd" "$@" ;;
+    esac
+}
+
+main "$@"
