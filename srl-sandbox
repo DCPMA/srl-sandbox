@@ -140,18 +140,50 @@ find_ssh_pubkey() {
     return 1
 }
 
+find_ssh_privkey() {
+    local key_types=("id_ed25519" "id_rsa" "id_ecdsa")
+    for kt in "${key_types[@]}"; do
+        local kf="$HOME/.ssh/${kt}"
+        if [[ -f "$kf" ]]; then
+            echo "$kf"
+            return 0
+        fi
+    done
+    return 1
+}
+
 inject_ssh_key() {
     local name="$1"
     local pubkey_file
     if pubkey_file=$(find_ssh_pubkey); then
-        cat "$pubkey_file" | container exec -i "$name" bash -c \
+        local err_output
+        err_output=$(cat "$pubkey_file" | container exec -i "$name" bash -c \
             "mkdir -p /home/${DEFAULT_USER}/.ssh && \
              chmod 700 /home/${DEFAULT_USER}/.ssh && \
              cat >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              sort -u -o /home/${DEFAULT_USER}/.ssh/authorized_keys /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              chmod 600 /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              chown -R ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.ssh" \
-            2>/dev/null && msg "SSH key injected" || warn "SSH key injection failed"
+            2>&1) || {
+            warn "SSH key injection failed: ${err_output}"
+            return 1
+        }
+        # Verify the key was actually written
+        local key_count
+        key_count=$(container exec "$name" bash -c \
+            "wc -l < /home/${DEFAULT_USER}/.ssh/authorized_keys" 2>/dev/null)
+        if [[ -n "$key_count" ]] && (( key_count > 0 )); then
+            msg "SSH key injected (${key_count} key(s) in authorized_keys)"
+        else
+            warn "SSH key injection may have failed — authorized_keys appears empty"
+            # Retry with explicit write as fallback
+            container exec "$name" bash -c \
+                "echo '$(cat "$pubkey_file")' >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+                 sort -u -o /home/${DEFAULT_USER}/.ssh/authorized_keys /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+                 chmod 600 /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+                 chown -R ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.ssh" \
+                2>/dev/null && msg "SSH key injected (fallback method)" || warn "SSH key injection failed completely"
+        fi
     else
         warn "No SSH public key found (~/.ssh/id_ed25519.pub, id_rsa.pub, etc.)"
         warn "VS Code Remote SSH requires a key. Run: ssh-keygen -t ed25519"
@@ -247,6 +279,13 @@ update_ssh_config() {
     mkdir -p "$HOME/.ssh"
     [[ ! -f "$ssh_config" ]] && touch "$ssh_config" && chmod 600 "$ssh_config"
 
+    # Find the private key file to set IdentityFile
+    local identity_line=""
+    local privkey_file
+    if privkey_file=$(find_ssh_privkey); then
+        identity_line="    IdentityFile ${privkey_file}"
+    fi
+
     # Remove existing entry for this sandbox
     local marker_start="# srl-sandbox-begin:${name}"
     local marker_end="# srl-sandbox-end:${name}"
@@ -262,7 +301,8 @@ Host ${name}
     User ${DEFAULT_USER}
     StrictHostKeyChecking accept-new
     UserKnownHostsFile /dev/null
-    AddKeysToAgent yes
+${identity_line:+${identity_line}
+}    AddKeysToAgent yes
     LogLevel ERROR
 ${marker_end}
 SSH_ENTRY
@@ -756,8 +796,6 @@ cmd_launch() {
 
         wait_container_ssh "$name" || warn "Container started but SSH may not be ready"
 
-        inject_ssh_key "$name"
-
         if [[ "$no_sync" != true ]]; then
             cmd_sync_internal "$name" "$proj_path" "$guest_project"
         fi
@@ -770,6 +808,9 @@ cmd_launch() {
         save_sandbox_state "$name" "$proj_path" "$cpus" "$mem" \
             "$(IFS=','; echo "${extra_mounts[*]}")" "$guest_project"
     fi
+
+    # Always ensure SSH key is injected (idempotent via sort -u)
+    inject_ssh_key "$name"
 
     # Refresh IP
     local ip=$(container_ip "$name")
