@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: zsh -n srl-sandbox
+
+      - name: Version consistency
+        run: |
+          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | tr -d 'VERSION="')
+          echo "Script version: $script_ver"
+          # If formula exists, check it matches
+          if [[ -f Formula/srl-sandbox.rb ]]; then
+            formula_ver=$(grep -o '/v[0-9.]*\.tar\.gz' Formula/srl-sandbox.rb | tr -d '/v.tar.gz' | head -1)
+            echo "Formula version: $formula_ver"
+            if [[ -n "$formula_ver" && "$script_ver" != "$formula_ver" ]]; then
+              echo "::error::Version mismatch: script=$script_ver formula=$formula_ver"
+              exit 1
+            fi
+          fi
+
+      - name: Shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          brew install shellcheck 2>/dev/null || true
+          shellcheck -s bash -S warning srl-sandbox || true
+
+      - name: Verify help and version
+        run: |
+          ./srl-sandbox version
+          ./srl-sandbox help | grep -q "launch"
+          ./srl-sandbox help | grep -q "destroy"
+          ./srl-sandbox help | grep -q "reset"
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
