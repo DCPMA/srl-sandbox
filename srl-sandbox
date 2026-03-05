@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly IMAGE_NAME="srl-sandbox"
 readonly IMAGE_TAG="latest"
 readonly IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
@@ -844,15 +844,47 @@ _foreground_wait() {
     # session and the container stopped), skip the wait.
     container_running "$name" || return 0
 
+    local ip
+    ip=$(container_ip "$name" 2>/dev/null)
+
     echo ""
-    msg "${DIM}Sandbox ${BOLD}${name}${NC}${DIM} is running. Press ${BOLD}Ctrl+C${NC}${DIM} to stop it.${NC}"
+    msg "${DIM}Sandbox ${BOLD}${name}${NC}${DIM} is running at ${BOLD}${ip:-unknown}${NC}"
+    echo ""
+    msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
 
     # Override the global trap to stop this specific container
     trap "_foreground_stop '$name'" INT
 
-    # Wait until the container stops or user hits Ctrl+C
+    # Read single keypress in a loop
     while container_running "$name"; do
-        sleep 2
+        local key=""
+        read -t 2 -k 1 key 2>/dev/null || true
+
+        case "${key:l}" in
+            v)
+                local guest_project
+                guest_project=$(json_get "$name" guest_project 2>/dev/null)
+                _launch_vscode_remote "$name" "$ip" "${guest_project:-/home/${DEFAULT_USER}}"
+                echo ""
+                msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                ;;
+            s)
+                echo ""
+                info "Launching SSH session... (type 'exit' to return)"
+                ssh -o StrictHostKeyChecking=accept-new "${DEFAULT_USER}@${ip}" 2>/dev/null || true
+                echo ""
+                msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                ;;
+            e)
+                echo ""
+                cmd_sync_extensions "$name"
+                echo ""
+                msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                ;;
+            q)
+                _foreground_stop "$name"
+                ;;
+        esac
     done
 
     # Container stopped on its own
