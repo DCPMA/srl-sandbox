@@ -31,36 +31,28 @@ Press **Ctrl+C** to stop. Use `-d` to launch detached.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `srl-sandbox [path]` | Launch/resume sandbox for a project |
-| `srl-sandbox [path] -d` | Launch detached (headless) |
-| `srl-sandbox stop <name or all>` | Stop sandbox(es) |
-| `srl-sandbox destroy <name or all>` | Remove sandbox(es) |
-| `srl-sandbox list` | List all sandboxes |
-| `srl-sandbox info <name>` | Show sandbox details |
-| `srl-sandbox ssh <name>` | SSH into a sandbox |
-| `srl-sandbox build` | Build/rebuild the container image |
-| `srl-sandbox reset [--all]` | Remove base image (--all destroys all sandboxes too) |
-| `srl-sandbox sync <name>` | Sync dotfiles into a sandbox |
-| `srl-sandbox version` | Show version |
+| Command                             | Description                                          |
+| ----------------------------------- | ---------------------------------------------------- |
+| `srl-sandbox [path]`                | Launch/resume sandbox for a project                  |
+| `srl-sandbox [path] -d`             | Launch detached (headless)                           |
+| `srl-sandbox stop <name or all>`    | Stop sandbox(es)                                     |
+| `srl-sandbox destroy <name or all>` | Remove sandbox(es)                                   |
+| `srl-sandbox list`                  | List all sandboxes                                   |
+| `srl-sandbox info <name>`           | Show sandbox details                                 |
+| `srl-sandbox ssh <name>`            | SSH into a sandbox                                   |
+| `srl-sandbox build`                 | Build/rebuild the container image                    |
+| `srl-sandbox reset [--all]`         | Remove base image (--all destroys all sandboxes too) |
+| `srl-sandbox sync <name>`           | Sync dotfiles into a sandbox                         |
+| `srl-sandbox version`               | Show version                                         |
 
 ## Mounts
 
-| Host | Container |
-|------|-----------|
+| Host              | Container                                          |
+| ----------------- | -------------------------------------------------- |
 | Project directory | `/home/dev/<dirname>` (symlinked from `~/project`) |
-| `~/.ssh` | `/home/dev/.ssh` (read-only) |
-| `~/.aws` | `/home/dev/.aws` (read-only) |
-| `~/.gitconfig` | `/home/dev/.gitconfig` (read-only) |
-
-## SSH Key Passphrase
-
-If VS Code prompts repeatedly for your SSH passphrase:
-
-```bash
-ssh-add --apple-use-keychain ~/.ssh/id_ed25519
-```
+| `~/.ssh`          | `/home/dev/.ssh` (read-only)                       |
+| `~/.aws`          | `/home/dev/.aws` (read-only)                       |
+| `~/.gitconfig`    | `/home/dev/.gitconfig` (read-only)                 |
 
 ## License
 
