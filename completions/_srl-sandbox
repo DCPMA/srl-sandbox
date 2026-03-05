@@ -34,6 +34,7 @@ _srl-sandbox() {
         'ssh:Shell into running sandbox'
         'exec:Run command in sandbox'
         'sync:Re-sync settings and configs'
+        'sync-extensions:Sync VS Code extensions and settings to sandbox'
         'info:Show sandbox details'
         'build:Rebuild container image'
         'reset:Remove base image (--all to destroy all sandboxes too)'
@@ -52,7 +53,7 @@ _srl-sandbox() {
                 _srl_sandbox_names_or_all
             fi
             ;;
-        destroy|ssh|sync|info)
+        destroy|ssh|sync|sync-extensions|info)
             if (( CURRENT == 3 )); then
                 _srl_sandbox_names
             fi

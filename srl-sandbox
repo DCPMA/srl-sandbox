@@ -506,6 +506,112 @@ cmd_sync() {
     msg "Sync complete for $name"
 }
 
+# ── VS Code Extension & Settings Sync ───────────────────────────────────────
+
+_find_remote_code_server() {
+    local name="$1"
+    container exec "$name" su - "${DEFAULT_USER}" -c \
+        "ls ~/.vscode-server/cli/servers/Stable-*/server/bin/code-server 2>/dev/null | head -1" \
+        2>/dev/null
+}
+
+cmd_sync_extensions() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox sync-extensions <name>"
+    local name="$1"
+    container_exists "$name" || die "Sandbox '$name' not found"
+    container_running "$name" || die "Sandbox '$name' is not running"
+
+    # Check host VS Code CLI
+    if ! command -v code &>/dev/null; then
+        die "VS Code CLI 'code' not found on host. Open VS Code and install the shell command."
+    fi
+
+    # Find code-server on the remote
+    local code_server
+    code_server=$(_find_remote_code_server "$name")
+    if [[ -z "$code_server" ]]; then
+        die "VS Code Server not found in sandbox. Connect VS Code Remote SSH first, then re-run."
+    fi
+
+    # Get host extensions
+    info "Listing host VS Code extensions..."
+    local -a host_exts=()
+    while IFS= read -r ext; do
+        [[ -n "$ext" ]] && host_exts+=("$ext")
+    done < <(code --list-extensions 2>/dev/null)
+
+    if [[ ${#host_exts[@]} -eq 0 ]]; then
+        warn "No extensions found on host."
+        return
+    fi
+    msg "Found ${#host_exts[@]} extensions on host"
+
+    # Get remote extensions
+    info "Listing remote extensions..."
+    local -a remote_exts=()
+    while IFS= read -r ext; do
+        [[ -n "$ext" ]] && remote_exts+=("${ext:l}")  # lowercase for comparison
+    done < <(container exec "$name" su - "${DEFAULT_USER}" -c \
+        "'${code_server}' --list-extensions 2>/dev/null" 2>/dev/null)
+
+    # UI-only extensions that don't need to be installed remotely
+    local -a skip_patterns=(
+        "theme" "icon" "color" "bracket" "indent-rainbow"
+        "vscode-icons" "material-icon" "one-dark" "dracula"
+    )
+
+    # Install missing extensions
+    local installed=0 skipped=0 failed=0
+    for ext in "${host_exts[@]}"; do
+        local ext_lower="${ext:l}"
+
+        # Skip if already installed
+        if printf '%s\n' "${remote_exts[@]}" | grep -qxi "$ext_lower"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Skip UI-only extensions (themes, icons)
+        local is_ui=false
+        for pattern in "${skip_patterns[@]}"; do
+            if [[ "$ext_lower" == *"$pattern"* ]]; then
+                is_ui=true
+                break
+            fi
+        done
+        if $is_ui; then
+            step "Skipping UI extension: $ext"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        info "Installing: $ext"
+        if container exec "$name" su - "${DEFAULT_USER}" -c \
+            "'${code_server}' --install-extension '$ext' --force 2>/dev/null" \
+            &>/dev/null; then
+            installed=$((installed + 1))
+        else
+            warn "Failed to install: $ext"
+            failed=$((failed + 1))
+        fi
+    done
+
+    echo ""
+    msg "Extension sync: ${installed} installed, ${skipped} skipped, ${failed} failed"
+
+    # Sync settings if requested
+    local host_settings="$HOME/Library/Application Support/Code/User/settings.json"
+    if [[ -f "$host_settings" ]]; then
+        info "Syncing VS Code settings..."
+        container exec "$name" su - "${DEFAULT_USER}" -c \
+            "mkdir -p ~/.vscode-server/data/Machine" 2>/dev/null
+        cat "$host_settings" | container exec -i "$name" su - "${DEFAULT_USER}" -c \
+            "cat > ~/.vscode-server/data/Machine/settings.json" \
+            2>/dev/null && msg "VS Code settings synced" \
+            || warn "Settings sync failed"
+    fi
+}
+
 # ── Code Server (on-demand) ─────────────────────────────────────────────────
 
 install_and_start_code_server() {
@@ -1027,6 +1133,7 @@ cmd_help() {
     printf "    ${CYAN}ssh${NC} ${DIM}<name>${NC}              Shell into running sandbox\n"
     printf "    ${CYAN}exec${NC} ${DIM}<name> <cmd>${NC}       Run command in sandbox\n"
     printf "    ${CYAN}sync${NC} ${DIM}<name>${NC}             Re-sync settings & configs\n"
+    printf "    ${CYAN}sync-extensions${NC} ${DIM}<name>${NC}  Sync VS Code extensions & settings to sandbox\n"
     printf "    ${CYAN}info${NC} ${DIM}<name>${NC}             Show sandbox details\n"
     printf "    ${CYAN}build${NC}                    Rebuild container image\n"
     printf "    ${CYAN}reset${NC} ${DIM}[--all]${NC}             Remove base image ${DIM}(--all: destroy all sandboxes too)${NC}\n"
@@ -1097,6 +1204,7 @@ main() {
         ssh)               check_container_cli; cmd_ssh "$@" ;;
         exec)              check_container_cli; cmd_exec "$@" ;;
         sync)              check_container_cli; cmd_sync "$@" ;;
+        sync-extensions)   check_container_cli; cmd_sync_extensions "$@" ;;
         info)              check_container_cli; cmd_info "$@" ;;
         build)             check_container_cli; cmd_build "$@" ;;
         reset)             check_container_cli; cmd_reset "$@" ;;

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: zsh -n srl-sandbox
+
+      - name: Version consistency
+        run: |
+          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
+          echo "Script version: $script_ver"
+          # If formula exists, check it matches
+          if [[ -f Formula/srl-sandbox.rb ]]; then
+            formula_ver=$(grep '/v.*\.tar\.gz' Formula/srl-sandbox.rb | sed 's|.*/v\([0-9][0-9.]*\)\.tar\.gz.*|\1|' | head -1)
+            echo "Formula version: $formula_ver"
+            if [[ -n "$formula_ver" && "$script_ver" != "$formula_ver" ]]; then
+              echo "::error::Version mismatch: script=$script_ver formula=$formula_ver"
+              exit 1
+            fi
+          fi
+
+      - name: Shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          brew install shellcheck 2>/dev/null || true
+          shellcheck -s bash -S warning srl-sandbox || true
+
+      - name: Verify help and version
+        run: |
+          ./srl-sandbox version
+          ./srl-sandbox help | grep -q "launch"
+          ./srl-sandbox help | grep -q "destroy"
+          ./srl-sandbox help | grep -q "reset"
+
+
