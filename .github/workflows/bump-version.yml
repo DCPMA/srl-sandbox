@@ -1,0 +1,69 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Bump & Release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate new version
+        id: calc
+        run: |
+          current=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
+          echo "Current: $current"
+
+          IFS='.' read -r major minor patch <<< "$current"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          new="${major}.${minor}.${patch}"
+          echo "New: $new"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Update VERSION in script
+        run: |
+          sed -i '' "s/VERSION=\"${{ steps.calc.outputs.current }}\"/VERSION=\"${{ steps.calc.outputs.new }}\"/" srl-sandbox
+
+      - name: Create PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="release/v${{ steps.calc.outputs.new }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add srl-sandbox
+          git commit -m "chore: bump version to ${{ steps.calc.outputs.new }}"
+          git push origin "$branch"
+
+          gh pr create \
+            --title "Release v${{ steps.calc.outputs.new }}" \
+            --body "Bumps VERSION from ${{ steps.calc.outputs.current }} to ${{ steps.calc.outputs.new }}.
+
+          Merging this PR will automatically create the \`v${{ steps.calc.outputs.new }}\` tag and trigger the release workflow." \
+            --base main \
+            --head "$branch" \
+            --label "release"

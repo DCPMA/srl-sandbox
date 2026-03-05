@@ -21,7 +21,7 @@ jobs:
 
       - name: Validate version matches script
         run: |
-          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | tr -d 'VERSION="')
+          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
           tag_ver="${{ steps.version.outputs.version }}"
           if [[ "$script_ver" != "$tag_ver" ]]; then
             echo "::error::Tag version ($tag_ver) doesn't match script version ($script_ver)"
