@@ -311,7 +311,7 @@ list_sandbox_names() {
 # Arrow-key based multi-select with ↑↓ navigation, Space toggle, Enter confirm.
 
 tui_multiselect() {
-    local -n _result=$1; shift
+    local _result_var=$1; shift
     local -a labels=() descs=() states=()
     local i=0
 
@@ -410,10 +410,10 @@ tui_multiselect() {
     done
 
     # Collect results
-    _result=()
+    eval "${_result_var}=()"
     for (( j=1; j<=count; j++ )); do
         if [[ "${states[$j]}" == "on" ]]; then
-            _result+=($((j - 1)))
+            eval "${_result_var}+=($((j - 1)))"
         fi
     done
 
