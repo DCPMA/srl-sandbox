@@ -36,6 +36,7 @@ _srl-sandbox() {
         'sync:Re-sync settings and configs'
         'info:Show sandbox details'
         'build:Rebuild container image'
+        'reset:Remove base image (--all to destroy all sandboxes too)'
         'help:Show help text'
         'version:Show version'
     )
@@ -70,10 +71,15 @@ _srl-sandbox() {
                 '--mem[RAM in GiB]:memory:(2 4 8 16 32)' \
                 '*--mount[Mount extra directory (host\:guest)]:mount spec:' \
                 '--no-sync[Skip settings sync]' \
-                '--headless[Do not open terminal/editor]' \
+                '--headless[Detach after launch]' \
+                '(-d --detach)'{-d,--detach}'[Detach after launch]' \
                 '*:project path:_directories'
             ;;
         build)
+            ;;
+        reset)
+            _arguments \
+                '--all[Destroy all sandboxes and remove image]'
             ;;
     esac
 }

@@ -256,6 +256,7 @@ Host ${name}
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     ForwardAgent yes
+    AddKeysToAgent yes
     LogLevel ERROR
 ${marker_end}
 SSH_ENTRY
@@ -285,10 +286,12 @@ sandbox_state_file() {
 save_sandbox_state() {
     local name="$1" proj_path="$2" cpus="$3" mem="$4"
     local extra_mounts="${5:-}"
+    local guest_project="${6:-/home/${DEFAULT_USER}/$(basename "$proj_path")}"
     cat > "$(sandbox_state_file "$name")" <<JSON
 {
   "name": "$name",
   "project_path": "$proj_path",
+  "guest_project": "$guest_project",
   "cpus": $cpus,
   "mem": $mem,
   "extra_mounts": "$extra_mounts",
@@ -422,13 +425,19 @@ tui_multiselect() {
 cmd_sync_internal() {
     local name="$1"
     local proj_path="${2:-}"
+    local guest_project="${3:-}"
+
+    # ── Derive guest project path if not given ───────────────────────────
+    if [[ -z "$guest_project" && -n "$proj_path" ]]; then
+        guest_project="/home/${DEFAULT_USER}/$(basename "$proj_path")"
+    fi
 
     # ── Project path symlink (mirror host path inside container) ─────────
-    if [[ -n "$proj_path" ]]; then
+    if [[ -n "$proj_path" && -n "$guest_project" ]]; then
         local parent_dir=$(dirname "$proj_path")
         info "Creating project path symlink..."
         container exec "$name" bash -c \
-            "mkdir -p '${parent_dir}' && ln -sfn /mnt/project '${proj_path}'" \
+            "mkdir -p '${parent_dir}' && ln -sfn '${guest_project}' '${proj_path}'" \
             2>/dev/null || warn "Project path symlink may have failed"
     fi
 
@@ -478,10 +487,13 @@ cmd_sync() {
     container_running "$name" || die "Sandbox '$name' is not running"
 
     local state_file=$(sandbox_state_file "$name")
-    local proj_path=""
-    [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
+    local proj_path="" guest_project=""
+    if [[ -f "$state_file" ]]; then
+        proj_path=$(json_get "$state_file" "project_path")
+        guest_project=$(json_get "$state_file" "guest_project")
+    fi
 
-    cmd_sync_internal "$name" "$proj_path"
+    cmd_sync_internal "$name" "$proj_path" "$guest_project"
     msg "Sync complete for $name"
 }
 
@@ -490,7 +502,7 @@ cmd_sync() {
 install_and_start_code_server() {
     local name="$1"
     local ip="$2"
-    local folder="${3:-/mnt/project}"
+    local folder="${3:-/home/${DEFAULT_USER}}"
 
     info "Installing code-server (on-demand)..."
     container exec "$name" su - "${DEFAULT_USER}" -c \
@@ -545,7 +557,7 @@ cmd_launch() {
             --mem)       mem="$2"; shift 2 ;;
             --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
-            --headless)  headless=true; shift ;;
+            --headless|--detach|-d) headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
             *)           proj_path="$1"; shift ;;
         esac
@@ -554,6 +566,16 @@ cmd_launch() {
     [[ -z "$proj_path" ]] && proj_path="$(pwd)"
     proj_path=$(cd "$proj_path" 2>/dev/null && pwd -P) || die "Invalid path: $proj_path"
     [[ -z "$name" ]] && name=$(derive_name "$proj_path")
+
+    local proj_dirname=$(basename "$proj_path")
+    local guest_project="/home/${DEFAULT_USER}/${proj_dirname}"
+
+    # Load guest_project from state if the sandbox already exists
+    local state_file=$(sandbox_state_file "$name")
+    if [[ -f "$state_file" ]]; then
+        local saved_gp=$(json_get "$state_file" "guest_project")
+        [[ -n "$saved_gp" ]] && guest_project="$saved_gp"
+    fi
 
     echo ""
     header "SRL Sandbox v${VERSION}"
@@ -579,7 +601,7 @@ cmd_launch() {
             --name "$name"
             --cpus "$cpus"
             --memory "${mem}G"
-            --volume "${proj_path}:/mnt/project"
+            --volume "${proj_path}:${guest_project}"
             --volume "$HOME/.claude:/mnt/claude"
             --volume "$HOME/.aws:/mnt/aws"
         )
@@ -597,7 +619,7 @@ cmd_launch() {
         inject_ssh_key "$name"
 
         if [[ "$no_sync" != true ]]; then
-            cmd_sync_internal "$name" "$proj_path"
+            cmd_sync_internal "$name" "$proj_path" "$guest_project"
         fi
 
         local ip=$(container_ip "$name")
@@ -606,7 +628,7 @@ cmd_launch() {
         fi
 
         save_sandbox_state "$name" "$proj_path" "$cpus" "$mem" \
-            "$(IFS=','; echo "${extra_mounts[*]}")"
+            "$(IFS=','; echo "${extra_mounts[*]}")" "$guest_project"
     fi
 
     # Refresh IP
@@ -625,7 +647,7 @@ cmd_launch() {
     # ── Interactive launch ───────────────────────────────────────────────
     echo ""
     if confirm_default_yes "Use defaults? (VS Code Remote SSH)"; then
-        _launch_vscode_remote "$name" "$ip"
+        _launch_vscode_remote "$name" "$ip" "$guest_project"
     else
         echo ""
         header "Configure"
@@ -657,25 +679,60 @@ cmd_launch() {
         echo ""
 
         if $run_code_server && [[ -n "$ip" ]]; then
-            install_and_start_code_server "$name" "$ip"
+            install_and_start_code_server "$name" "$ip" "$guest_project"
         fi
 
         if $run_vscode; then
-            _launch_vscode_remote "$name" "$ip"
+            _launch_vscode_remote "$name" "$ip" "$guest_project"
         fi
 
         if $run_claude; then
-            _launch_claude "$name" "$run_skip_perms"
+            _launch_claude "$name" "$run_skip_perms" "$guest_project"
         elif $run_shell; then
-            _launch_shell "$name"
+            _launch_shell "$name" "$guest_project"
         fi
     fi
+
+    # ── Foreground wait ──────────────────────────────────────────────────
+    _foreground_wait "$name"
+}
+
+_foreground_wait() {
+    local name="$1"
+
+    # If the container is no longer running (e.g. user exited an interactive
+    # session and the container stopped), skip the wait.
+    container_running "$name" || return 0
+
+    echo ""
+    msg "${DIM}Sandbox ${BOLD}${name}${NC}${DIM} is running. Press ${BOLD}Ctrl+C${NC}${DIM} to stop it.${NC}"
+
+    # Override the global trap to stop this specific container
+    trap "_foreground_stop '$name'" INT
+
+    # Wait until the container stops or user hits Ctrl+C
+    while container_running "$name"; do
+        sleep 2
+    done
+
+    # Container stopped on its own
+    echo ""
+    info "Sandbox '$name' has stopped."
+}
+
+_foreground_stop() {
+    local name="$1"
+    echo ""
+    info "Stopping sandbox '$name'..."
+    container stop "$name" 2>/dev/null || true
+    msg "Sandbox '$name' stopped."
+    exit 0
 }
 
 _launch_vscode_remote() {
     local name="$1"
     local ip="$2"
-    local remote_folder="/mnt/project"
+    local remote_folder="${3:-/home/${DEFAULT_USER}}"
     local remote_uri="vscode://vscode-remote/ssh-remote+${name}${remote_folder}"
     info "Opening VS Code → ${name}:${remote_folder}"
     open "$remote_uri" 2>/dev/null \
@@ -686,10 +743,11 @@ _launch_vscode_remote() {
 _launch_claude() {
     local name="$1"
     local skip_perms="$2"
+    local guest_project="${3:-/home/${DEFAULT_USER}}"
 
     if container exec "$name" su - "${DEFAULT_USER}" -c \
         "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
-        local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd /mnt/project && claude"
+        local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd ${guest_project} && claude"
         if [[ "$skip_perms" == "true" ]]; then
             claude_cmd+=" --dangerously-skip-permissions"
             info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
@@ -700,14 +758,15 @@ _launch_claude() {
         container exec -ti "$name" su - "${DEFAULT_USER}" -c "$claude_cmd"
     else
         warn "Claude Code not found in container. Falling back to shell."
-        _launch_shell "$name"
+        _launch_shell "$name" "$guest_project"
     fi
 }
 
 _launch_shell() {
     local name="$1"
+    local guest_project="${2:-/home/${DEFAULT_USER}}"
     container exec -ti "$name" su - "${DEFAULT_USER}" -c \
-        "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+        "cd ${guest_project} 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_stop() {
@@ -808,8 +867,15 @@ cmd_ssh() {
     container_exists "$name" || die "Sandbox '$name' not found"
     container_running "$name" || die "Sandbox '$name' is not running"
 
+    local state_file=$(sandbox_state_file "$name")
+    local guest_project="/home/${DEFAULT_USER}"
+    if [[ -f "$state_file" ]]; then
+        local gp=$(json_get "$state_file" "guest_project")
+        [[ -n "$gp" && "$gp" != "null" ]] && guest_project="$gp"
+    fi
+
     container exec -ti "$name" su - "${DEFAULT_USER}" -c \
-        "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+        "cd ${guest_project} 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_exec() {
@@ -830,13 +896,15 @@ cmd_info() {
     container_running "$name" && is_running=true
 
     local state_file=$(sandbox_state_file "$name")
-    local proj_path="-" cpus="-" mem="-" created="-" extra_mounts="-"
+    local proj_path="-" cpus="-" mem="-" created="-" extra_mounts="-" guest_project="/home/${DEFAULT_USER}"
     if [[ -f "$state_file" ]]; then
         proj_path=$(json_get "$state_file" "project_path")
         cpus=$(json_get "$state_file" "cpus")
         mem=$(json_get "$state_file" "mem")
         created=$(json_get "$state_file" "created")
         extra_mounts=$(json_get "$state_file" "extra_mounts")
+        local gp=$(json_get "$state_file" "guest_project")
+        [[ -n "$gp" && "$gp" != "null" ]] && guest_project="$gp"
     fi
 
     local ip="-"
@@ -860,7 +928,7 @@ cmd_info() {
 
     echo ""
     printf "  ${BOLD}Mounts${NC}\n"
-    printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "/mnt/project"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "$guest_project"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/mnt/claude → ~/.claude"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/mnt/aws → ~/.aws"
     if [[ -n "$extra_mounts" && "$extra_mounts" != "-" ]]; then
@@ -884,10 +952,53 @@ cmd_info() {
         echo ""
         printf "  ${BOLD}Quick Access${NC}\n"
         printf "  ${CYAN}ssh${NC}     ssh ${name}\n"
-        printf "  ${CYAN}vscode${NC}  code --remote ssh-remote+${name} /mnt/project\n"
+        printf "  ${CYAN}vscode${NC}  code --remote ssh-remote+${name} ${guest_project}\n"
         printf "  ${CYAN}claude${NC}  srl-sandbox exec ${name} 'source ~/.nvm/nvm.sh && claude'\n"
     fi
     echo ""
+}
+
+cmd_reset() {
+    local remove_all=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)  remove_all=true; shift ;;
+            -*)     die "Unknown option: $1" ;;
+            *)      die "Usage: srl-sandbox reset [--all]" ;;
+        esac
+    done
+
+    echo ""
+    header "SRL Sandbox Reset"
+
+    if $remove_all; then
+        confirm "Destroy ALL sandboxes and remove the base image? This cannot be undone." \
+            || { info "Cancelled."; return; }
+
+        # Destroy all sandboxes
+        local names=($(list_sandbox_names))
+        for n in "${names[@]}"; do
+            info "Destroying sandbox: $n"
+            container_running "$n" && container stop "$n" 2>/dev/null || true
+            sleep 0.5
+            container rm "$n" 2>/dev/null || container delete "$n" 2>/dev/null || true
+            remove_ssh_config "$n"
+            local sf=$(sandbox_state_file "$n")
+            [[ -f "$sf" ]] && rm -f "$sf"
+        done
+    else
+        confirm "Remove the base image '${IMAGE_REF}'? Running sandboxes are not affected." \
+            || { info "Cancelled."; return; }
+    fi
+
+    # Remove the base image
+    info "Removing image '${IMAGE_REF}'..."
+    container image rm "${IMAGE_REF}" 2>/dev/null \
+        && msg "Image '${IMAGE_REF}' removed" \
+        || info "Image not found or already removed"
+
+    echo ""
+    success "Reset complete. Run 'srl-sandbox build' to rebuild the image."
 }
 
 cmd_help() {
@@ -908,6 +1019,7 @@ cmd_help() {
     printf "    ${CYAN}sync${NC} ${DIM}<name>${NC}             Re-sync settings & configs\n"
     printf "    ${CYAN}info${NC} ${DIM}<name>${NC}             Show sandbox details\n"
     printf "    ${CYAN}build${NC}                    Rebuild container image\n"
+    printf "    ${CYAN}reset${NC} ${DIM}[--all]${NC}             Remove base image ${DIM}(--all: destroy all sandboxes too)${NC}\n"
     printf "    ${CYAN}help${NC}                     Show this help\n"
     echo ""
     printf "  ${BOLD}Launch Options${NC}\n"
@@ -916,7 +1028,7 @@ cmd_help() {
     printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
     printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
-    printf "    ${CYAN}--headless${NC}               Don't open terminal/editor after launch\n"
+    printf "    ${CYAN}--headless${NC} / ${CYAN}-d${NC}          Detach: don't open editor or wait in foreground\n"
     echo ""
     printf "  ${BOLD}Interactive Menu${NC}\n"
     printf "    On launch, choose defaults (VS Code Remote SSH) or configure:\n"
@@ -977,6 +1089,7 @@ main() {
         sync)              check_container_cli; cmd_sync "$@" ;;
         info)              check_container_cli; cmd_info "$@" ;;
         build)             check_container_cli; cmd_build "$@" ;;
+        reset)             check_container_cli; cmd_reset "$@" ;;
         help|--help|-h)    cmd_help ;;
         version|--version|-v) echo "srl-sandbox v${VERSION}" ;;
         -*)                check_container_cli; cmd_launch "$cmd" "$@" ;;
