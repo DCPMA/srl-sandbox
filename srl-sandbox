@@ -71,22 +71,29 @@ confirm_default_yes() {
     [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]
 }
 
+validate_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] \
+        || die "Invalid sandbox name: '${name}' — only alphanumeric, hyphens, dots, underscores allowed (max 63 chars)"
+}
+
 json_get() {
     local file="$1" key="$2"
-    python3 -c "import json,sys; d=json.load(open('$file')); print(d.get('$key',''))" 2>/dev/null
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get(sys.argv[2],''))" "$file" "$key" 2>/dev/null
 }
 
 json_set() {
     local file="$1" key="$2" val="$3"
     python3 -c "
 import json,sys
+f=sys.argv[1]; k=sys.argv[2]; v=json.loads(sys.argv[3])
 try:
-    d=json.load(open('$file'))
+    d=json.load(open(f))
 except:
     d={}
-d['$key']=$val
-json.dump(d,open('$file','w'),indent=2)
-"
+d[k]=v
+json.dump(d,open(f,'w'),indent=2)
+" "$file" "$key" "$val"
 }
 
 # ── Prerequisite checks ─────────────────────────────────────────────────────
@@ -137,11 +144,10 @@ inject_ssh_key() {
     local name="$1"
     local pubkey_file
     if pubkey_file=$(find_ssh_pubkey); then
-        local pubkey=$(cat "$pubkey_file")
-        container exec "$name" bash -c \
+        cat "$pubkey_file" | container exec -i "$name" bash -c \
             "mkdir -p /home/${DEFAULT_USER}/.ssh && \
              chmod 700 /home/${DEFAULT_USER}/.ssh && \
-             echo '${pubkey}' >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+             cat >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              sort -u -o /home/${DEFAULT_USER}/.ssh/authorized_keys /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              chmod 600 /home/${DEFAULT_USER}/.ssh/authorized_keys && \
              chown -R ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.ssh" \
@@ -166,6 +172,7 @@ container_ip() {
     local name="$1"
     container ls --format json 2>/dev/null | python3 -c "
 import json, sys
+target = sys.argv[1]
 try:
     data = json.load(sys.stdin)
 except:
@@ -174,7 +181,7 @@ for c in data:
     if not isinstance(c, dict):
         continue
     cid = c.get('configuration', {}).get('id', '')
-    if cid == '${name}':
+    if cid == target:
         nets = c.get('networks', [])
         if isinstance(nets, list):
             for n in nets:
@@ -183,7 +190,7 @@ for c in data:
                     print(addr.split('/')[0])
                     sys.exit(0)
         break
-" 2>/dev/null || true
+" "$name" 2>/dev/null || true
 }
 
 wait_container_ssh() {
@@ -253,9 +260,8 @@ ${marker_start}
 Host ${name}
     HostName ${ip}
     User ${DEFAULT_USER}
-    StrictHostKeyChecking no
+    StrictHostKeyChecking accept-new
     UserKnownHostsFile /dev/null
-    ForwardAgent yes
     AddKeysToAgent yes
     LogLevel ERROR
 ${marker_end}
@@ -287,17 +293,20 @@ save_sandbox_state() {
     local name="$1" proj_path="$2" cpus="$3" mem="$4"
     local extra_mounts="${5:-}"
     local guest_project="${6:-/home/${DEFAULT_USER}/$(basename "$proj_path")}"
-    cat > "$(sandbox_state_file "$name")" <<JSON
-{
-  "name": "$name",
-  "project_path": "$proj_path",
-  "guest_project": "$guest_project",
-  "cpus": $cpus,
-  "mem": $mem,
-  "extra_mounts": "$extra_mounts",
-  "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    python3 -c "
+import json,sys
+d = {
+    'name': sys.argv[1],
+    'project_path': sys.argv[2],
+    'guest_project': sys.argv[3],
+    'cpus': int(sys.argv[4]),
+    'mem': int(sys.argv[5]),
+    'extra_mounts': sys.argv[6],
+    'created': sys.argv[7]
 }
-JSON
+json.dump(d, open(sys.argv[8], 'w'), indent=2)
+" "$name" "$proj_path" "$guest_project" "$cpus" "$mem" "$extra_mounts" "$created" "$(sandbox_state_file "$name")"
 }
 
 list_sandbox_names() {
@@ -469,8 +478,8 @@ cmd_sync_internal() {
         local gh_token
         gh_token=$(gh auth token 2>/dev/null)
         if [[ -n "$gh_token" ]]; then
-            container exec "$name" su - "${DEFAULT_USER}" -c \
-                "command -v gh &>/dev/null && echo '${gh_token}' | gh auth login --with-token 2>/dev/null && gh auth setup-git 2>/dev/null" \
+            echo "$gh_token" | container exec -i "$name" su - "${DEFAULT_USER}" -c \
+                "command -v gh &>/dev/null && gh auth login --with-token 2>/dev/null && gh auth setup-git 2>/dev/null" \
                 2>/dev/null \
                 && msg "GitHub auth synced (gh CLI)" \
                 || warn "GitHub auth sync failed"
@@ -511,7 +520,7 @@ install_and_start_code_server() {
 
     info "Starting code-server..."
     container exec -d "$name" su - "${DEFAULT_USER}" -c \
-        "code-server --bind-addr 0.0.0.0:8080 --auth none '${folder}' &>/dev/null &" \
+        "code-server --bind-addr 127.0.0.1:8080 --auth none '${folder}' &>/dev/null &" \
         2>/dev/null || { warn "code-server start failed"; return 1; }
 
     local elapsed=0 timeout=20
@@ -566,6 +575,7 @@ cmd_launch() {
     [[ -z "$proj_path" ]] && proj_path="$(pwd)"
     proj_path=$(cd "$proj_path" 2>/dev/null && pwd -P) || die "Invalid path: $proj_path"
     [[ -z "$name" ]] && name=$(derive_name "$proj_path")
+    validate_name "$name"
 
     local proj_dirname=$(basename "$proj_path")
     local guest_project="/home/${DEFAULT_USER}/${proj_dirname}"
@@ -747,7 +757,7 @@ _launch_claude() {
 
     if container exec "$name" su - "${DEFAULT_USER}" -c \
         "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
-        local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd ${guest_project} && claude"
+        local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd '${guest_project}' && claude"
         if [[ "$skip_perms" == "true" ]]; then
             claude_cmd+=" --dangerously-skip-permissions"
             info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
@@ -766,7 +776,7 @@ _launch_shell() {
     local name="$1"
     local guest_project="${2:-/home/${DEFAULT_USER}}"
     container exec -ti "$name" su - "${DEFAULT_USER}" -c \
-        "cd ${guest_project} 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+        "cd '${guest_project}' 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_stop() {
@@ -875,7 +885,7 @@ cmd_ssh() {
     fi
 
     container exec -ti "$name" su - "${DEFAULT_USER}" -c \
-        "cd ${guest_project} 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+        "cd '${guest_project}' 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_exec() {
