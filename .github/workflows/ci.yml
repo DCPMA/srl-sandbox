@@ -21,11 +21,11 @@ jobs:
 
       - name: Version consistency
         run: |
-          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | tr -d 'VERSION="')
+          script_ver=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
           echo "Script version: $script_ver"
           # If formula exists, check it matches
           if [[ -f Formula/srl-sandbox.rb ]]; then
-            formula_ver=$(grep -o '/v[0-9.]*\.tar\.gz' Formula/srl-sandbox.rb | tr -d '/v.tar.gz' | head -1)
+            formula_ver=$(grep '/v.*\.tar\.gz' Formula/srl-sandbox.rb | sed 's|.*/v\([0-9][0-9.]*\)\.tar\.gz.*|\1|' | head -1)
             echo "Formula version: $formula_ver"
             if [[ -n "$formula_ver" && "$script_ver" != "$formula_ver" ]]; then
               echo "::error::Version mismatch: script=$script_ver formula=$formula_ver"
