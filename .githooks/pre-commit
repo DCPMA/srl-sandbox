@@ -37,8 +37,8 @@ printf "${BOLD}Running pre-commit checks...${NC}\n"
 # 1. Shell syntax check
 check "Shell syntax (zsh -n)" "zsh -n srl-sandbox"
 
-# 2. Version consistency
-check "Version consistency" '
+# 2. Version consistency (advisory — formula updated by release workflow)
+advisory "Version consistency" '
     script_ver=$(grep -o "VERSION=\"[^\"]*\"" srl-sandbox | head -1 | sed "s/VERSION=\"//;s/\"//")
     if [[ -f Formula/srl-sandbox.rb ]]; then
         formula_ver=$(grep "/v.*\.tar\.gz" Formula/srl-sandbox.rb | sed "s|.*/v\([0-9][0-9.]*\)\.tar\.gz.*|\1|" | head -1)
