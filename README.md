@@ -2,6 +2,28 @@
 
 Sandboxed dev environments on macOS using [Apple Container](https://github.com/apple/container). Isolated Linux containers for safe coding with LLM agents like Claude Code.
 
+```mermaid
+graph LR
+    subgraph "macOS Host"
+        Dev["Developer"]
+        VSCode["VS Code"]
+        Deploy["Build · Test · Deploy"]
+    end
+
+    subgraph "Sandbox (Lightweight VM)"
+        Agent["AI Agent<br/>(Claude Code)"]
+        Code["Source Code<br/>(mounted)"]
+    end
+
+    Dev -- "launches" --> Agent
+    Dev -- "hotkeys: v/s/e" --> VSCode
+    VSCode -- "Remote SSH" --> Code
+    Agent -- "reads & writes" --> Code
+    Code -. "synced mount" .-> Deploy
+```
+
+> **Design principle:** The sandbox is for **agent-driven development only** — AI agents read/write code in an isolated environment. Building, testing, deployment, and hosting remain on the host machine or CI/CD.
+
 ## Requirements
 
 - macOS 26+ (Tahoe) with Apple Silicon
