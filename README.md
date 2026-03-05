@@ -78,13 +78,13 @@ Press **Enter** → VS Code opens connected to the container. Press **n** → co
 
 ## What Gets Synced
 
-| Item        | Source (macOS)                       | Destination (Container)               |
-| ----------- | ------------------------------------ | ------------------------------------- |
+| Item        | Source (macOS)                       | Destination (Container)              |
+| ----------- | ------------------------------------ | ------------------------------------ |
 | Project     | Project directory                    | `/mnt/project` (+ host-path symlink) |
 | Claude      | `~/.claude/`                         | `/mnt/claude` → `~/.claude`          |
-| AWS         | `~/.aws/`                            | `/mnt/aws` → `~/.aws`               |
+| AWS         | `~/.aws/`                            | `/mnt/aws` → `~/.aws`                |
 | Git config  | `~/.gitconfig`, `~/.gitconfig.local` | `~/.gitconfig` (copied)              |
-| GitHub auth | `gh auth token`                      | `gh auth login --with-token`          |
+| GitHub auth | `gh auth token`                      | `gh auth login --with-token`         |
 | SSH keys    | `~/.ssh/id_*.pub`                    | `~/.ssh/authorized_keys`             |
 
 ## Networking & DNS

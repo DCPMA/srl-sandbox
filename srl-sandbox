@@ -116,7 +116,6 @@ ensure_dns() {
     if ! container system dns list 2>/dev/null | grep -q "${DNS_DOMAIN}" 2>/dev/null; then
         info "Setting up DNS domain '${DNS_DOMAIN}'..."
         sudo container system dns create "${DNS_DOMAIN}" 2>/dev/null || true
-        container system dns default set "${DNS_DOMAIN}" 2>/dev/null || true
     fi
 }
 
@@ -139,7 +138,7 @@ inject_ssh_key() {
     local pubkey_file
     if pubkey_file=$(find_ssh_pubkey); then
         local pubkey=$(cat "$pubkey_file")
-        container exec "$name" -- bash -c \
+        container exec "$name" bash -c \
             "mkdir -p /home/${DEFAULT_USER}/.ssh && \
              chmod 700 /home/${DEFAULT_USER}/.ssh && \
              echo '${pubkey}' >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
@@ -172,22 +171,17 @@ try:
 except:
     sys.exit(0)
 for c in data:
-    cname = ''
-    if isinstance(c, dict):
-        cname = c.get('name', '') or c.get('configuration', {}).get('name', '')
-    if cname == '${name}':
-        nets = c.get('networks', {})
-        addr = ''
-        if isinstance(nets, dict):
-            addr = nets.get('address', '')
-        elif isinstance(nets, list):
+    if not isinstance(c, dict):
+        continue
+    cid = c.get('configuration', {}).get('id', '')
+    if cid == '${name}':
+        nets = c.get('networks', [])
+        if isinstance(nets, list):
             for n in nets:
-                a = n.get('address', '') or n.get('ipAddress', '')
-                if a:
-                    addr = a
-                    break
-        if addr:
-            print(addr.split('/')[0])
+                addr = n.get('ipv4Address', '')
+                if addr:
+                    print(addr.split('/')[0])
+                    sys.exit(0)
         break
 " 2>/dev/null || true
 }
@@ -247,10 +241,10 @@ update_ssh_config() {
     [[ ! -f "$ssh_config" ]] && touch "$ssh_config" && chmod 600 "$ssh_config"
 
     # Remove existing entry for this sandbox
-    local marker_start="# srl-sandbox:${name}"
-    local marker_end="# /srl-sandbox:${name}"
+    local marker_start="# srl-sandbox-begin:${name}"
+    local marker_end="# srl-sandbox-end:${name}"
     if grep -q "$marker_start" "$ssh_config" 2>/dev/null; then
-        sed -i '' "/${marker_start}/,/${marker_end}/d" "$ssh_config"
+        sed -i '' "\|${marker_start}|,\|${marker_end}|d" "$ssh_config"
     fi
 
     # Add new entry
@@ -275,10 +269,10 @@ remove_ssh_config() {
     local ssh_config="$HOME/.ssh/config"
     [[ ! -f "$ssh_config" ]] && return
 
-    local marker_start="# srl-sandbox:${name}"
-    local marker_end="# /srl-sandbox:${name}"
+    local marker_start="# srl-sandbox-begin:${name}"
+    local marker_end="# srl-sandbox-end:${name}"
     if grep -q "$marker_start" "$ssh_config" 2>/dev/null; then
-        sed -i '' "/${marker_start}/,/${marker_end}/d" "$ssh_config"
+        sed -i '' "\|${marker_start}|,\|${marker_end}|d" "$ssh_config"
     fi
 }
 
@@ -433,13 +427,13 @@ cmd_sync_internal() {
     if [[ -n "$proj_path" ]]; then
         local parent_dir=$(dirname "$proj_path")
         info "Creating project path symlink..."
-        container exec "$name" -- bash -c \
+        container exec "$name" bash -c \
             "mkdir -p '${parent_dir}' && ln -sfn /mnt/project '${proj_path}'" \
             2>/dev/null || warn "Project path symlink may have failed"
     fi
 
     # ── Claude & AWS config symlinks ─────────────────────────────────────
-    container exec "$name" -- bash -c \
+    container exec "$name" bash -c \
         "ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
          ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
          chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.aws 2>/dev/null" \
@@ -449,12 +443,12 @@ cmd_sync_internal() {
     info "Syncing Git configuration..."
     local git_synced=false
     if [[ -f "$HOME/.gitconfig" ]]; then
-        cat "$HOME/.gitconfig" | container exec -i "$name" -- \
+        cat "$HOME/.gitconfig" | container exec -i "$name" \
             bash -c "cat > /home/${DEFAULT_USER}/.gitconfig && chown ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.gitconfig" \
             2>/dev/null && git_synced=true || warn "Failed to copy .gitconfig"
     fi
     if [[ -f "$HOME/.gitconfig.local" ]]; then
-        cat "$HOME/.gitconfig.local" | container exec -i "$name" -- \
+        cat "$HOME/.gitconfig.local" | container exec -i "$name" \
             bash -c "cat > /home/${DEFAULT_USER}/.gitconfig.local && chown ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.gitconfig.local" \
             2>/dev/null || warn "Failed to copy .gitconfig.local"
     fi
@@ -466,7 +460,7 @@ cmd_sync_internal() {
         local gh_token
         gh_token=$(gh auth token 2>/dev/null)
         if [[ -n "$gh_token" ]]; then
-            container exec "$name" -- su - "${DEFAULT_USER}" -c \
+            container exec "$name" su - "${DEFAULT_USER}" -c \
                 "command -v gh &>/dev/null && echo '${gh_token}' | gh auth login --with-token 2>/dev/null && gh auth setup-git 2>/dev/null" \
                 2>/dev/null \
                 && msg "GitHub auth synced (gh CLI)" \
@@ -499,12 +493,12 @@ install_and_start_code_server() {
     local folder="${3:-/mnt/project}"
 
     info "Installing code-server (on-demand)..."
-    container exec "$name" -- su - "${DEFAULT_USER}" -c \
+    container exec "$name" su - "${DEFAULT_USER}" -c \
         "curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone 2>/dev/null" \
         2>/dev/null || { warn "code-server installation failed"; return 1; }
 
     info "Starting code-server..."
-    container exec -d "$name" -- su - "${DEFAULT_USER}" -c \
+    container exec -d "$name" su - "${DEFAULT_USER}" -c \
         "code-server --bind-addr 0.0.0.0:8080 --auth none '${folder}' &>/dev/null &" \
         2>/dev/null || { warn "code-server start failed"; return 1; }
 
@@ -529,7 +523,7 @@ cmd_build() {
     info "Includes: Debian Bookworm, Node.js 24, Claude Code, gh, AWS CLI, SSH"
     echo ""
 
-    container image build -t "${IMAGE_REF}" "$SCRIPT_DIR" || die "Image build failed"
+    container build -t "${IMAGE_REF}" "$SCRIPT_DIR" || die "Image build failed"
 
     echo ""
     success "Image '${IMAGE_REF}' built successfully"
@@ -584,7 +578,7 @@ cmd_launch() {
             run -d
             --name "$name"
             --cpus "$cpus"
-            --memory "${mem}g"
+            --memory "${mem}G"
             --volume "${proj_path}:/mnt/project"
             --volume "$HOME/.claude:/mnt/claude"
             --volume "$HOME/.aws:/mnt/aws"
@@ -693,7 +687,7 @@ _launch_claude() {
     local name="$1"
     local skip_perms="$2"
 
-    if container exec "$name" -- su - "${DEFAULT_USER}" -c \
+    if container exec "$name" su - "${DEFAULT_USER}" -c \
         "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
         local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd /mnt/project && claude"
         if [[ "$skip_perms" == "true" ]]; then
@@ -703,7 +697,7 @@ _launch_claude() {
             info "Launching Claude Code..."
         fi
         echo ""
-        container exec -ti "$name" -- su - "${DEFAULT_USER}" -c "$claude_cmd"
+        container exec -ti "$name" su - "${DEFAULT_USER}" -c "$claude_cmd"
     else
         warn "Claude Code not found in container. Falling back to shell."
         _launch_shell "$name"
@@ -712,7 +706,7 @@ _launch_claude() {
 
 _launch_shell() {
     local name="$1"
-    container exec -ti "$name" -- su - "${DEFAULT_USER}" -c \
+    container exec -ti "$name" su - "${DEFAULT_USER}" -c \
         "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
@@ -775,29 +769,31 @@ cmd_list() {
     printf "  ${DIM}%-30s  %-10s  %-16s  %s${NC}\n" \
         "────────────────────────────" "─────────" "───────────────" "───────────────────────"
 
+    local sb_status proj_path ip state_file status_icon color_status
     for name in "${names[@]}"; do
-        local status="unknown" proj_path="-" ip="-"
+        sb_status="unknown"
+        proj_path="-"
+        ip="-"
 
         if container_running "$name"; then
-            status="running"
+            sb_status="running"
             ip=$(container_ip "$name")
             [[ -z "$ip" ]] && ip="-"
         elif container_exists "$name"; then
-            status="stopped"
+            sb_status="stopped"
         else
-            status="deleted"
+            sb_status="deleted"
         fi
 
-        local state_file=$(sandbox_state_file "$name")
+        state_file=$(sandbox_state_file "$name")
         [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
         [[ -z "$proj_path" ]] && proj_path="-"
 
-        local status_icon color_status
-        case "$status" in
-            running) status_icon="${GREEN}●${NC}"; color_status="${GREEN}${status}${NC}" ;;
-            stopped) status_icon="${RED}●${NC}";   color_status="${RED}${status}${NC}" ;;
-            deleted) status_icon="${RED}○${NC}";   color_status="${RED}${status}${NC}" ;;
-            *)       status_icon="${DIM}?${NC}";   color_status="$status" ;;
+        case "$sb_status" in
+            running) status_icon="${GREEN}●${NC}"; color_status="${GREEN}${sb_status}${NC}" ;;
+            stopped) status_icon="${RED}●${NC}";   color_status="${RED}${sb_status}${NC}" ;;
+            deleted) status_icon="${RED}○${NC}";   color_status="${RED}${sb_status}${NC}" ;;
+            *)       status_icon="${DIM}?${NC}";   color_status="$sb_status" ;;
         esac
 
         printf "  %-30s  %b %-10b  %-16s  ${DIM}%s${NC}\n" \
@@ -812,7 +808,7 @@ cmd_ssh() {
     container_exists "$name" || die "Sandbox '$name' not found"
     container_running "$name" || die "Sandbox '$name' is not running"
 
-    container exec -ti "$name" -- su - "${DEFAULT_USER}" -c \
+    container exec -ti "$name" su - "${DEFAULT_USER}" -c \
         "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
@@ -822,7 +818,7 @@ cmd_exec() {
     container_exists "$name" || die "Sandbox '$name' not found"
     container_running "$name" || die "Sandbox '$name' is not running"
 
-    container exec "$name" -- su - "${DEFAULT_USER}" -c "$*"
+    container exec "$name" su - "${DEFAULT_USER}" -c "$*"
 }
 
 cmd_info() {
