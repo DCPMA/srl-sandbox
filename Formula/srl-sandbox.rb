@@ -13,7 +13,7 @@ class SrlSandbox < Formula
   sha256 "7315cac8e304bf9e982ed4391e8a30096e42ff10ba981a3571b0a97efa13261e"
   license "MIT"
 
-  head "https://github.com/DCPMA/srl-sandbox.git", branch: "v2/apple-container"
+  head "https://github.com/DCPMA/srl-sandbox.git", branch: "main"
 
   depends_on :macos
 
@@ -22,12 +22,12 @@ class SrlSandbox < Formula
     bin.install "srl-sandbox"
 
     # Install the Containerfile alongside the script in share
-    (share/"srl-sandbox").install "Containerfile"
+    pkgshare.install "Containerfile"
 
     # Patch the script to find the Containerfile in the share directory
     inreplace bin/"srl-sandbox",
               'readonly SCRIPT_DIR="${0:A:h}"',
-              "readonly SCRIPT_DIR=\"#{share}/srl-sandbox\""
+              "readonly SCRIPT_DIR=\"#{pkgshare}\""
 
     # Install zsh completions
     zsh_completion.install "completions/_srl-sandbox"
