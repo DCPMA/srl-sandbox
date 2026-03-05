@@ -7,6 +7,9 @@
 
 FROM debian:bookworm-slim
 
+# ── Build arguments ──────────────────────────────────────────────────────────
+ARG PYTHON_VERSION=3.13.12
+
 # ── System packages ──────────────────────────────────────────────────────────
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -14,8 +17,27 @@ RUN apt-get update -qq && \
         build-essential python3 python3-pip python3-venv \
         unzip zsh tmux htop sudo \
         openssh-server \
-        ca-certificates gnupg lsb-release && \
+        ca-certificates gnupg lsb-release \
+        libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+        libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+        libffi-dev liblzma-dev && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Python (from source, configurable version) ──────────────────────────────
+RUN cd /tmp && \
+    curl -fsSL "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz" -o python.tgz && \
+    tar xzf python.tgz && \
+    cd "Python-${PYTHON_VERSION}" && \
+    ./configure --prefix=/usr/local && \
+    make -j"$(nproc)" && \
+    make altinstall && \
+    cd / && rm -rf /tmp/python.tgz /tmp/Python-${PYTHON_VERSION} && \
+    PYMAJMIN=$(echo "${PYTHON_VERSION}" | cut -d. -f1,2) && \
+    ln -sf "/usr/local/bin/python${PYMAJMIN}" /usr/local/bin/python3 && \
+    ln -sf "/usr/local/bin/python${PYMAJMIN}" /usr/local/bin/python && \
+    ln -sf "/usr/local/bin/pip${PYMAJMIN}" /usr/local/bin/pip3 && \
+    ln -sf "/usr/local/bin/pip${PYMAJMIN}" /usr/local/bin/pip && \
+    python3 --version
 
 # ── GitHub CLI ───────────────────────────────────────────────────────────────
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

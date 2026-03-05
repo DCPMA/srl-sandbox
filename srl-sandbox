@@ -710,11 +710,27 @@ install_and_start_code_server() {
 cmd_build() {
     [[ ! -f "$CONTAINERFILE" ]] && die "Containerfile not found at $CONTAINERFILE"
 
-    info "Building container image '${IMAGE_REF}'..."
-    info "Includes: Debian Bookworm, Node.js 24, Claude Code, gh, AWS CLI, SSH"
+    local -a build_args=()
+    local python_version=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --python)  python_version="$2"; shift 2 ;;
+            -*)        die "Unknown build option: $1" ;;
+            *)         shift ;;
+        esac
+    done
+
+    if [[ -n "$python_version" ]]; then
+        build_args+=(--build-arg "PYTHON_VERSION=${python_version}")
+        info "Building container image '${IMAGE_REF}' with Python ${python_version}..."
+    else
+        info "Building container image '${IMAGE_REF}'..."
+    fi
+    info "Includes: Debian Bookworm, Python, Node.js 24, Claude Code, gh, AWS CLI, SSH"
     echo ""
 
-    container build -t "${IMAGE_REF}" "$SCRIPT_DIR" || die "Image build failed"
+    container build "${build_args[@]}" -t "${IMAGE_REF}" "$SCRIPT_DIR" || die "Image build failed"
 
     echo ""
     success "Image '${IMAGE_REF}' built successfully"
@@ -888,6 +904,9 @@ _foreground_wait() {
     local ip
     ip=$(container_ip "$name" 2>/dev/null)
 
+    local state_file
+    state_file=$(sandbox_state_file "$name")
+
     echo ""
     msg "${DIM}Sandbox ${BOLD}${name}${NC}${DIM} is running at ${BOLD}${ip:-unknown}${NC}"
     echo ""
@@ -896,6 +915,12 @@ _foreground_wait() {
     # Override the global trap to stop this specific container
     trap "_foreground_stop '$name'" INT
 
+    # Suppress character echo so keypresses don't print to terminal
+    stty -echo 2>/dev/null
+    # Ensure terminal is restored on exit
+    trap "stty echo 2>/dev/null; _foreground_stop '$name'" INT
+    trap "stty echo 2>/dev/null" RETURN
+
     # Read single keypress in a loop
     while container_running "$name"; do
         local key=""
@@ -903,32 +928,40 @@ _foreground_wait() {
 
         case "${key:l}" in
             v)
+                stty echo 2>/dev/null
                 local guest_project
-                guest_project=$(json_get "$name" guest_project 2>/dev/null)
+                guest_project=$(json_get "$state_file" guest_project 2>/dev/null)
                 _launch_vscode_remote "$name" "$ip" "${guest_project:-/home/${DEFAULT_USER}}"
                 echo ""
                 msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                stty -echo 2>/dev/null
                 ;;
             s)
+                stty echo 2>/dev/null
                 echo ""
                 info "Launching SSH session... (type 'exit' to return)"
                 ssh -o StrictHostKeyChecking=accept-new "${DEFAULT_USER}@${ip}" 2>/dev/null || true
                 echo ""
                 msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                stty -echo 2>/dev/null
                 ;;
             e)
+                stty echo 2>/dev/null
                 echo ""
                 cmd_sync_extensions "$name"
                 echo ""
                 msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
+                stty -echo 2>/dev/null
                 ;;
             q)
+                stty echo 2>/dev/null
                 _foreground_stop "$name"
                 ;;
         esac
     done
 
     # Container stopped on its own
+    stty echo 2>/dev/null
     echo ""
     info "Sandbox '$name' has stopped."
 }
