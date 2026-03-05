@@ -1,5 +1,5 @@
 #compdef srl-sandbox
-# Zsh tab-completion for srl-sandbox
+# Zsh tab-completion for srl-sandbox v2 (Apple Container)
 
 _srl_sandbox_names() {
     local -a names
@@ -29,14 +29,14 @@ _srl-sandbox() {
     commands=(
         'launch:Create or resume sandbox for project directory'
         'stop:Stop a sandbox'
-        'suspend:Suspend sandbox (preserves RAM state)'
-        'destroy:Delete sandbox VM and state'
+        'destroy:Delete container and state'
         'list:List all sandboxes with status'
-        'ssh:SSH into running sandbox'
+        'ssh:Shell into running sandbox'
         'exec:Run command in sandbox'
-        'provision:Set up base VM template via Ansible'
-        'sync:Re-sync settings and symlinks'
+        'sync:Re-sync settings and configs'
         'info:Show sandbox details'
+        'build:Rebuild container image'
+        'reset:Remove base image (--all to destroy all sandboxes too)'
         'help:Show help text'
         'version:Show version'
     )
@@ -47,7 +47,7 @@ _srl-sandbox() {
     fi
 
     case "${words[2]}" in
-        stop|suspend)
+        stop)
             if (( CURRENT == 3 )); then
                 _srl_sandbox_names_or_all
             fi
@@ -68,15 +68,18 @@ _srl-sandbox() {
             _arguments \
                 '--name[Override sandbox name]:name:' \
                 '--cpus[CPU cores]:cores:(1 2 4 8)' \
-                '--mem[RAM in MB]:memory:(2048 4096 8192 16384)' \
-                '--no-claude[Do not auto-launch Claude Code]' \
+                '--mem[RAM in GiB]:memory:(2 4 8 16 32)' \
+                '*--mount[Mount extra directory (host\:guest)]:mount spec:' \
                 '--no-sync[Skip settings sync]' \
-                '--headless[Do not open terminal]' \
+                '--headless[Detach after launch]' \
+                '(-d --detach)'{-d,--detach}'[Detach after launch]' \
                 '*:project path:_directories'
             ;;
-        provision)
+        build)
+            ;;
+        reset)
             _arguments \
-                '--from[Source VM to clone]:vm name:'
+                '--all[Destroy all sandboxes and remove image]'
             ;;
     esac
 }
