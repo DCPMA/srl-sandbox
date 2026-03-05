@@ -1,4 +1,4 @@
-name: Auto Tag
+name: Auto Tag & Release
 
 on:
   pull_request:
@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  tag:
-    name: Create Release Tag
+  release:
+    name: Tag & Release
     if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: macos-latest
     steps:
@@ -19,20 +19,63 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Extract version and tag
+      - name: Extract version and create tag
+        id: tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
           tag="v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
           if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists — skipping"
-            exit 0
+            echo "Tag $tag already exists — skipping tag creation"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Creating tag: $tag"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Release $tag"
+            git push origin "$tag"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Creating tag: $tag"
+      - name: Syntax check
+        run: zsh -n srl-sandbox
+
+      - name: Create GitHub Release
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "srl-sandbox ${{ steps.tag.outputs.tag }}" \
+            --generate-notes
+
+      - name: Compute tarball SHA256 and update formula
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+
+          # Wait for tarball to be available
+          for i in 1 2 3 4 5; do
+            sha=$(curl -sL "$url" | shasum -a 256 | cut -d' ' -f1)
+            [[ ${#sha} -eq 64 ]] && break
+            sleep 5
+          done
+          echo "SHA256: $sha"
+
+          sed -i '' "s|url \"https://github.com/.*/archive/refs/tags/.*\.tar\.gz\"|url \"${url}\"|" Formula/srl-sandbox.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"${sha}\"|" Formula/srl-sandbox.rb
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "Release $tag"
-          git push origin "$tag"
+          git add Formula/srl-sandbox.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update formula for ${tag}"
+            git push origin HEAD:main
+          fi
