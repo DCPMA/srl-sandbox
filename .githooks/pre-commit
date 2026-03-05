@@ -1,0 +1,66 @@
+#!/usr/bin/env zsh
+# Pre-commit hook: runs the same checks as CI locally for fast iteration
+set -e
+
+BOLD='\033[1m' RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m' NC='\033[0m'
+
+passed=0 failed=0 warned=0
+
+check() {
+    local label="$1"; shift
+    printf "${BOLD}  ▶ %s...${NC} " "$label"
+    if eval "$@" >/dev/null 2>&1; then
+        printf "${GREEN}✓${NC}\n"
+        passed=$((passed + 1))
+    else
+        printf "${RED}✗${NC}\n"
+        failed=$((failed + 1))
+        return 1
+    fi
+}
+
+advisory() {
+    local label="$1"; shift
+    printf "${BOLD}  ▶ %s...${NC} " "$label"
+    if eval "$@" >/dev/null 2>&1; then
+        printf "${GREEN}✓${NC}\n"
+        passed=$((passed + 1))
+    else
+        printf "${YELLOW}⚠${NC} (advisory)\n"
+        warned=$((warned + 1))
+    fi
+}
+
+echo ""
+printf "${BOLD}Running pre-commit checks...${NC}\n"
+
+# 1. Shell syntax check
+check "Shell syntax (zsh -n)" "zsh -n srl-sandbox"
+
+# 2. Version consistency
+check "Version consistency" '
+    script_ver=$(grep -o "VERSION=\"[^\"]*\"" srl-sandbox | head -1 | sed "s/VERSION=\"//;s/\"//")
+    if [[ -f Formula/srl-sandbox.rb ]]; then
+        formula_ver=$(grep "/v.*\.tar\.gz" Formula/srl-sandbox.rb | sed "s|.*/v\([0-9][0-9.]*\)\.tar\.gz.*|\1|" | head -1)
+        [[ -z "$formula_ver" || "$script_ver" == "$formula_ver" ]]
+    fi
+'
+
+# 3. Help/version sanity
+check "Help output" "./srl-sandbox help | grep -q launch && ./srl-sandbox help | grep -q destroy"
+check "Version output" "./srl-sandbox version"
+
+# 4. Shellcheck (advisory — won't block commit)
+if command -v shellcheck &>/dev/null; then
+    advisory "Shellcheck" "shellcheck -s bash -S warning srl-sandbox"
+else
+    printf "${BOLD}  ▶ Shellcheck...${NC} ${YELLOW}skipped${NC} (not installed)\n"
+fi
+
+echo ""
+if [[ $failed -gt 0 ]]; then
+    printf "${RED}${BOLD}Pre-commit: %d passed, %d failed, %d warnings — commit blocked${NC}\n\n" $passed $failed $warned
+    exit 1
+else
+    printf "${GREEN}${BOLD}Pre-commit: %d passed, %d warnings — OK${NC}\n\n" $passed $warned
+fi

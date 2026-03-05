@@ -1,0 +1,38 @@
+name: Auto Tag
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Create Release Tag
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Extract version and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
+          tag="v${version}"
+
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists — skipping"
+            exit 0
+          fi
+
+          echo "Creating tag: $tag"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"

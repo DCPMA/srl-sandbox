@@ -560,8 +560,9 @@ cmd_sync_extensions() {
         "vscode-icons" "material-icon" "one-dark" "dracula"
     )
 
-    # Install missing extensions
-    local installed=0 skipped=0 failed=0
+    # Build list of extensions to install
+    local -a to_install=()
+    local skipped=0
     for ext in "${host_exts[@]}"; do
         local ext_lower="${ext:l}"
 
@@ -585,19 +586,42 @@ cmd_sync_extensions() {
             continue
         fi
 
-        info "Installing: $ext"
-        if container exec "$name" su - "${DEFAULT_USER}" -c \
-            "'${code_server}' --install-extension '$ext' --force 2>/dev/null" \
-            &>/dev/null; then
-            installed=$((installed + 1))
-        else
-            warn "Failed to install: $ext"
-            failed=$((failed + 1))
-        fi
+        to_install+=("$ext")
     done
 
-    echo ""
-    msg "Extension sync: ${installed} installed, ${skipped} skipped, ${failed} failed"
+    if [[ ${#to_install[@]} -eq 0 ]]; then
+        msg "Extension sync: 0 installed, ${skipped} skipped, 0 failed"
+        # fall through to settings sync
+    else
+        # Batch all installs into a single container exec to avoid per-extension
+        # process spawn overhead (~40 execs → 1 exec)
+        info "Installing ${#to_install[@]} extensions in single batch..."
+        local install_script="installed=0; failed=0"
+        for ext in "${to_install[@]}"; do
+            install_script+="; if '${code_server}' --install-extension '${ext}' --force >/dev/null 2>&1; then installed=\$((installed+1)); echo \"OK: ${ext}\"; else failed=\$((failed+1)); echo \"FAIL: ${ext}\"; fi"
+        done
+        install_script+='; echo "RESULT:${installed}:${failed}"'
+
+        local batch_output
+        batch_output=$(container exec "$name" su - "${DEFAULT_USER}" -c "$install_script" 2>/dev/null)
+
+        # Parse results from batch output
+        local installed=0 failed=0
+        local result_line
+        result_line=$(echo "$batch_output" | grep '^RESULT:' | tail -1)
+        if [[ -n "$result_line" ]]; then
+            installed=$(echo "$result_line" | cut -d: -f2)
+            failed=$(echo "$result_line" | cut -d: -f3)
+        fi
+
+        # Show any failures
+        echo "$batch_output" | grep '^FAIL:' | while IFS= read -r line; do
+            warn "Failed to install: ${line#FAIL: }"
+        done
+
+        echo ""
+        msg "Extension sync: ${installed} installed, ${skipped} skipped, ${failed} failed"
+    fi
 
     # Sync settings if requested
     local host_settings="$HOME/Library/Application Support/Code/User/settings.json"
