@@ -1,23 +1,28 @@
 #!/usr/bin/env zsh
-# srl-sandbox — Lightweight Parallels VM Launcher for Claude Code
-# Spins up isolated sandboxes so Claude Code can run with --dangerously-skip-permissions
+# srl-sandbox v2 — Sandboxed development environments using Apple Container
+# Spins up isolated Linux containers on macOS 26+ (Apple Silicon) for safe
+# coding with LLM agents like Claude Code.
+#
+# Backend: Apple Container (github.com/apple/container)
+# Each container = its own lightweight VM with sub-second startup.
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
-readonly PRLCTL="/usr/local/bin/prlctl"
+readonly VERSION="2.0.0"
+readonly IMAGE_NAME="srl-sandbox"
+readonly IMAGE_TAG="latest"
+readonly IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
 readonly CONFIG_DIR="$HOME/.config/srl-sandbox"
 readonly SANDBOXES_DIR="$CONFIG_DIR/sandboxes"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
-readonly SSH_TIMEOUT=120
 readonly DEFAULT_CPUS=2
-readonly DEFAULT_MEM=4096
-readonly DEFAULT_USER="parallels"
-readonly KEYCHAIN_SERVICE="srl-sandbox"
-readonly KEYCHAIN_ACCOUNT="vm-password"
+readonly DEFAULT_MEM=4
+readonly DEFAULT_USER="dev"
+readonly DNS_DOMAIN="test"
 readonly SCRIPT_DIR="${0:A:h}"
+readonly CONTAINERFILE="$SCRIPT_DIR/Containerfile"
 
-# Colors (ANSI-C quoting so escapes are interpreted at assignment)
+# ── Colors ───────────────────────────────────────────────────────────────────
 readonly RED=$'\033[0;31m'
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[1;33m'
@@ -49,7 +54,7 @@ spin() {
         sleep 0.1
         i=$((i + 1))
     done
-    printf "\r"
+    printf "\r\033[K"
 }
 
 confirm() {
@@ -57,6 +62,13 @@ confirm() {
     printf "${YELLOW}%s${NC} [y/N] " "$prompt"
     read -r reply
     [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+confirm_default_yes() {
+    local prompt="${1:-Continue?}"
+    printf "${YELLOW}%s${NC} [Y/n] " "$prompt"
+    read -r reply
+    [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]
 }
 
 json_get() {
@@ -77,54 +89,39 @@ json.dump(d,open('$file','w'),indent=2)
 "
 }
 
-# ── Keychain ─────────────────────────────────────────────────────────────────
+# ── Prerequisite checks ─────────────────────────────────────────────────────
 
-keychain_set() {
-    local password="$1"
-    # Delete existing entry if present (ignore errors)
-    security delete-generic-password \
-        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
-    # Add new entry
-    security add-generic-password \
-        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" \
-        -w "$password" \
-        -T "" \
-        2>/dev/null || die "Failed to store password in Keychain"
-    msg "Password stored in macOS Keychain (service: $KEYCHAIN_SERVICE)"
-}
-
-keychain_get() {
-    security find-generic-password \
-        -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" \
-        -w 2>/dev/null
-}
-
-keychain_has() {
-    keychain_get &>/dev/null
-}
-
-prompt_and_store_password() {
-    local password=""
-    if keychain_has; then
-        local existing=$(keychain_get)
-        info "Found existing VM password in Keychain."
-        if ! confirm "Use existing password? (N to enter a new one)"; then
-            printf "${CYAN}Enter VM password for user '%s': ${NC}" "$DEFAULT_USER"
-            read -rs password
-            echo ""
-            [[ -z "$password" ]] && die "Password cannot be empty"
-            keychain_set "$password"
-        fi
-    else
-        printf "${CYAN}Enter VM password for user '%s': ${NC}" "$DEFAULT_USER"
-        read -rs password
-        echo ""
-        [[ -z "$password" ]] && die "Password cannot be empty"
-        keychain_set "$password"
+check_container_cli() {
+    if ! command -v container &>/dev/null; then
+        die "Apple Container CLI not found. Install from: https://github.com/apple/container/releases"
     fi
 }
 
-# Find host SSH public key
+check_image() {
+    container image ls 2>/dev/null | grep -q "${IMAGE_NAME}" 2>/dev/null
+}
+
+ensure_image() {
+    if ! check_image; then
+        echo ""
+        info "Container image '${IMAGE_REF}' not found."
+        info "Building image from Containerfile (this takes a few minutes on first run)..."
+        echo ""
+        cmd_build
+    fi
+}
+
+ensure_dns() {
+    # Set up DNS domain for <name>.test hostnames
+    if ! container system dns list 2>/dev/null | grep -q "${DNS_DOMAIN}" 2>/dev/null; then
+        info "Setting up DNS domain '${DNS_DOMAIN}'..."
+        sudo container system dns create "${DNS_DOMAIN}" 2>/dev/null || true
+        container system dns default set "${DNS_DOMAIN}" 2>/dev/null || true
+    fi
+}
+
+# ── SSH key management ───────────────────────────────────────────────────────
+
 find_ssh_pubkey() {
     local key_types=("id_ed25519" "id_rsa" "id_ecdsa")
     for kt in "${key_types[@]}"; do
@@ -137,92 +134,92 @@ find_ssh_pubkey() {
     return 1
 }
 
-# SSH with keychain password fallback (uses SSH_ASKPASS if key auth fails)
-ssh_with_auth() {
-    local user="$1" ip="$2"; shift 2
-    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
-
-    # Try key-based auth first (will succeed silently if key is in authorized_keys)
-    if ssh -o BatchMode=yes "${ssh_opts[@]}" -o ConnectTimeout=5 \
-           "${user}@${ip}" true 2>/dev/null; then
-        ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@"
-        return $?
-    fi
-
-    # Fall back to SSH_ASKPASS + Keychain password
-    if keychain_has; then
-        local askpass_script
-        askpass_script=$(mktemp "${TMPDIR:-/tmp}/srl-askpass.XXXXXX")
-        cat > "$askpass_script" <<'ASKPASS'
-#!/bin/sh
-security find-generic-password -s "srl-sandbox" -a "vm-password" -w 2>/dev/null
-ASKPASS
-        chmod +x "$askpass_script"
-        local rc=0
-        SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
-            ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@" || rc=$?
-        rm -f "$askpass_script"
-        return $rc
-    fi
-
-    # Last resort: interactive SSH
-    ssh -t "${ssh_opts[@]}" "${user}@${ip}" "$@"
-}
-
-# Check if browsers have macOS Local Network permission (needed to reach VM IPs)
-check_local_network_access() {
-    local ip="$1"
-    # Quick connectivity test from a non-CLI context isn't possible,
-    # so we check if the user has been warned before
-    local marker="$CONFIG_DIR/.local-network-checked"
-    if [[ ! -f "$marker" ]]; then
-        echo ""
-        info "${BOLD}First-time setup:${NC} Your browser needs macOS Local Network permission"
-        info "to reach the VM at ${ip}."
-        echo ""
-        info "If the URL doesn't load in Chrome/Safari/Firefox:"
-        info "  1. Open ${BOLD}System Settings > Privacy & Security > Local Network${NC}"
-        info "  2. Toggle ${BOLD}ON${NC} for your browser"
-        info "  3. Restart the browser and try again"
-        echo ""
-        touch "$marker"
+inject_ssh_key() {
+    local name="$1"
+    local pubkey_file
+    if pubkey_file=$(find_ssh_pubkey); then
+        local pubkey=$(cat "$pubkey_file")
+        container exec "$name" -- bash -c \
+            "mkdir -p /home/${DEFAULT_USER}/.ssh && \
+             chmod 700 /home/${DEFAULT_USER}/.ssh && \
+             echo '${pubkey}' >> /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+             sort -u -o /home/${DEFAULT_USER}/.ssh/authorized_keys /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+             chmod 600 /home/${DEFAULT_USER}/.ssh/authorized_keys && \
+             chown -R ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.ssh" \
+            2>/dev/null && msg "SSH key injected" || warn "SSH key injection failed"
+    else
+        warn "No SSH public key found (~/.ssh/id_ed25519.pub, id_rsa.pub, etc.)"
+        warn "VS Code Remote SSH requires a key. Run: ssh-keygen -t ed25519"
     fi
 }
 
-# Start code-server inside the VM and wait for it to be reachable
-# Usage: start_code_server <ip> [folder_path]
-start_code_server() {
-    local ip="$1"
-    local folder="${2:-}"
-    info "Starting code-server..."
+# ── Container helpers ────────────────────────────────────────────────────────
 
-    # Try restart (handles both not-running and already-running cases)
-    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-        "sudo systemctl restart code-server@parallels" 2>/dev/null || {
-        # Fallback: try start if restart fails
-        ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-            "sudo systemctl start code-server@parallels" 2>/dev/null || true
-    }
+container_exists() {
+    container ls -a 2>/dev/null | grep -qw "$1"
+}
 
+container_running() {
+    container ls 2>/dev/null | grep -qw "$1"
+}
+
+container_ip() {
+    local name="$1"
+    container ls --format json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except:
+    sys.exit(0)
+for c in data:
+    cname = ''
+    if isinstance(c, dict):
+        cname = c.get('name', '') or c.get('configuration', {}).get('name', '')
+    if cname == '${name}':
+        nets = c.get('networks', {})
+        addr = ''
+        if isinstance(nets, dict):
+            addr = nets.get('address', '')
+        elif isinstance(nets, list):
+            for n in nets:
+                a = n.get('address', '') or n.get('ipAddress', '')
+                if a:
+                    addr = a
+                    break
+        if addr:
+            print(addr.split('/')[0])
+        break
+" 2>/dev/null || true
+}
+
+wait_container_ssh() {
+    local name="$1"
+    local timeout="${2:-60}"
     local elapsed=0
-    local timeout=30
+    info "Waiting for container SSH to become ready..."
     while (( elapsed < timeout )); do
-        if nc -z -G 2 "$ip" 8080 &>/dev/null; then
-            local url="http://${ip}:8080"
-            [[ -n "$folder" ]] && url="${url}/?folder=${folder}"
-            msg "Code Server: ${BOLD}${url}${NC}"
+        local ip=$(container_ip "$name")
+        if [[ -n "$ip" ]] && nc -z -G 2 "$ip" 22 &>/dev/null; then
+            msg "Container SSH ready at ${ip}"
             return 0
         fi
         sleep 1
         elapsed=$((elapsed + 1))
-        printf "\r${CYAN}⏳${NC} Waiting for code-server... %ds / %ds" "$elapsed" "$timeout"
+        printf "\r${CYAN}⏳${NC} %ds / %ds" "$elapsed" "$timeout"
     done
     printf "\n"
-    warn "code-server not reachable after ${timeout}s"
-    # Print diagnostic info
-    info "Checking code-server status in VM..."
-    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-        "sudo systemctl status code-server@parallels --no-pager 2>&1 | tail -5" 2>/dev/null || true
+    warn "SSH not reachable after ${timeout}s."
+    return 1
+}
+
+# ── Naming ───────────────────────────────────────────────────────────────────
+
+derive_name() {
+    local dir_path="$1"
+    local abs_path=$(cd "$dir_path" 2>/dev/null && pwd -P) || die "Invalid path: $dir_path"
+    local dirname=$(basename "$abs_path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+    local hash=$(echo -n "$abs_path" | shasum -a 1 | cut -c1-4)
+    echo "srl-${dirname}-${hash}"
 }
 
 # ── Init ─────────────────────────────────────────────────────────────────────
@@ -232,177 +229,60 @@ init_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat > "$CONFIG_FILE" <<'JSON'
 {
-  "base_vm": "",
   "default_cpus": 2,
-  "default_mem": 4096,
-  "default_user": "parallels",
-  "source_vm": "Debian GNU Linux 12.11 ARM64"
+  "default_mem": 4
 }
 JSON
-        info "Created config at $CONFIG_FILE"
     fi
 }
 
-check_parallels() {
-    if [[ ! -x "$PRLCTL" ]]; then
-        die "prlctl not found at $PRLCTL. Is Parallels Desktop installed?"
-    fi
-    if ! pgrep -q "prl_client_app\|prl_disp_service" 2>/dev/null; then
-        warn "Parallels Desktop may not be running. Commands might fail."
-    fi
-}
+# ── SSH config integration ───────────────────────────────────────────────────
 
-# ── Naming ───────────────────────────────────────────────────────────────────
-
-derive_name() {
-    local dir_path="$1"
-    local abs_path=$(cd "$dir_path" 2>/dev/null && pwd -P) || die "Invalid path: $dir_path"
-    local dirname=$(basename "$abs_path" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
-    local hash=$(echo -n "$abs_path" | shasum -a 1 | cut -c1-4)
-    echo "srl-${dirname}-${hash}"
-}
-
-base_name() {
-    local source="$1"
-    local ts=$(date +%s)
-    local hash=$(echo -n "${source}${ts}" | shasum -a 1 | cut -c1-4)
-    echo "srl-base-${hash}"
-}
-
-# ── VM Helpers ───────────────────────────────────────────────────────────────
-
-vm_exists() {
-    $PRLCTL list -a --no-header -o name 2>/dev/null | grep -qx "$1"
-}
-
-vm_status() {
-    $PRLCTL list -a --no-header -o status,name 2>/dev/null | grep " $1$" | awk '{print $1}'
-}
-
-vm_ip() {
+update_ssh_config() {
     local name="$1"
-    local ip=""
-    # Try prlctl exec first (requires Parallels Tools)
-    ip=$($PRLCTL exec "$name" -- hostname -I 2>/dev/null | awk '{print $1}') || true
-    if [[ -z "$ip" ]]; then
-        # Fallback: Parallels JSON API (works without guest tools)
-        ip=$($PRLCTL list -f -j 2>/dev/null | python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-for vm in data:
-    if vm.get('name')=='$name':
-        print(vm.get('ip_configured',''))
-        break
-" 2>/dev/null) || true
+    local ip="$2"
+    local ssh_config="$HOME/.ssh/config"
+
+    mkdir -p "$HOME/.ssh"
+    [[ ! -f "$ssh_config" ]] && touch "$ssh_config" && chmod 600 "$ssh_config"
+
+    # Remove existing entry for this sandbox
+    local marker_start="# srl-sandbox:${name}"
+    local marker_end="# /srl-sandbox:${name}"
+    if grep -q "$marker_start" "$ssh_config" 2>/dev/null; then
+        sed -i '' "/${marker_start}/,/${marker_end}/d" "$ssh_config"
     fi
-    echo "$ip"
+
+    # Add new entry
+    cat >> "$ssh_config" <<SSH_ENTRY
+${marker_start}
+Host ${name}
+    HostName ${ip}
+    User ${DEFAULT_USER}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ForwardAgent yes
+    LogLevel ERROR
+${marker_end}
+SSH_ENTRY
+
+    chmod 600 "$ssh_config"
+    msg "SSH config updated: Host ${name} → ${ip}"
 }
 
-wait_ssh() {
+remove_ssh_config() {
     local name="$1"
-    local timeout="${2:-$SSH_TIMEOUT}"
-    local elapsed=0
-    info "Waiting for VM to become reachable (timeout: ${timeout}s)..."
-    while (( elapsed < timeout )); do
-        # Try prlctl exec first (requires Parallels Tools in guest)
-        if $PRLCTL exec "$name" -- echo "ready" &>/dev/null; then
-            msg "VM is ready (via prlctl exec)"
-            return 0
-        fi
-        # Fallback: check if SSH port is open via IP from Parallels JSON API
-        local ip
-        ip=$($PRLCTL list -f -j 2>/dev/null | python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-for vm in data:
-    if vm.get('name')=='$name':
-        v=vm.get('ip_configured','')
-        if v and v!='-' and not v.startswith('fe80'):
-            print(v)
-        break
-" 2>/dev/null) || true
-        if [[ -n "$ip" ]] && nc -z -G 2 "$ip" 22 &>/dev/null; then
-            msg "VM is ready (SSH port open at $ip)"
-            return 0
-        fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-        printf "\r${CYAN}⏳${NC} %ds / %ds" "$elapsed" "$timeout"
-    done
-    printf "\n"
-    die "SSH timeout after ${timeout}s. VM may still be booting."
+    local ssh_config="$HOME/.ssh/config"
+    [[ ! -f "$ssh_config" ]] && return
+
+    local marker_start="# srl-sandbox:${name}"
+    local marker_end="# /srl-sandbox:${name}"
+    if grep -q "$marker_start" "$ssh_config" 2>/dev/null; then
+        sed -i '' "/${marker_start}/,/${marker_end}/d" "$ssh_config"
+    fi
 }
 
-get_base_vm() {
-    local base=$(json_get "$CONFIG_FILE" "base_vm")
-    if [[ -z "$base" ]] || ! vm_exists "$base"; then
-        echo ""
-        warn "No base VM found. A provisioned base image is required to create sandboxes."
-        echo ""
-        if confirm "Would you like to provision a base image now?"; then
-            local source=$(json_get "$CONFIG_FILE" "source_vm")
-            if [[ -n "$source" ]] && vm_exists "$source"; then
-                info "Source VM from config: ${BOLD}${source}${NC}"
-                if confirm "Use '${source}' as the source?"; then
-                    cmd_provision --from "$source"
-                else
-                    # List available VMs for the user to choose
-                    echo ""
-                    info "Available VMs:"
-                    local vms=()
-                    while IFS= read -r vm_name; do
-                        vms+=("$vm_name")
-                    done < <($PRLCTL list -a --no-header -o name 2>/dev/null | grep -v '^srl-')
-                    local i=1
-                    for vm_name in "${vms[@]}"; do
-                        printf "  ${CYAN}%d)${NC} %s\n" "$i" "$vm_name"
-                        i=$((i + 1))
-                    done
-                    echo ""
-                    printf "${CYAN}Select source VM [1-%d]: ${NC}" "${#vms[@]}"
-                    read -r choice
-                    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#vms[@]} )); then
-                        cmd_provision --from "${vms[$choice]}"
-                    else
-                        die "Invalid selection."
-                    fi
-                fi
-            else
-                # No configured source — list all non-srl VMs
-                echo ""
-                info "Available VMs to use as source:"
-                local vms=()
-                while IFS= read -r vm_name; do
-                    vms+=("$vm_name")
-                done < <($PRLCTL list -a --no-header -o name 2>/dev/null | grep -v '^srl-')
-                if [[ ${#vms[@]} -eq 0 ]]; then
-                    die "No VMs found in Parallels. Create a Debian/Ubuntu VM first."
-                fi
-                local i=1
-                for vm_name in "${vms[@]}"; do
-                    printf "  ${CYAN}%d)${NC} %s\n" "$i" "$vm_name"
-                    i=$((i + 1))
-                done
-                echo ""
-                printf "${CYAN}Select source VM [1-%d]: ${NC}" "${#vms[@]}"
-                read -r choice
-                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#vms[@]} )); then
-                    cmd_provision --from "${vms[$choice]}"
-                else
-                    die "Invalid selection."
-                fi
-            fi
-            # Re-read base VM after provisioning
-            base=$(json_get "$CONFIG_FILE" "base_vm")
-            if [[ -z "$base" ]] || ! vm_exists "$base"; then
-                die "Provisioning completed but base VM not found. Check provisioning output."
-            fi
-        else
-            die "Cannot create sandbox without a base VM. Run 'srl-sandbox provision' first."
-        fi
-    fi
-    echo "$base"
-}
+# ── State management ────────────────────────────────────────────────────────
 
 sandbox_state_file() {
     echo "$SANDBOXES_DIR/$1.json"
@@ -410,12 +290,14 @@ sandbox_state_file() {
 
 save_sandbox_state() {
     local name="$1" proj_path="$2" cpus="$3" mem="$4"
+    local extra_mounts="${5:-}"
     cat > "$(sandbox_state_file "$name")" <<JSON
 {
   "name": "$name",
   "project_path": "$proj_path",
   "cpus": $cpus,
   "mem": $mem,
+  "extra_mounts": "$extra_mounts",
   "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
@@ -428,132 +310,229 @@ list_sandbox_names() {
     done
 }
 
-# ── Commands ─────────────────────────────────────────────────────────────────
+# ── Interactive TUI Menu ────────────────────────────────────────────────────
+# Arrow-key based multi-select with ↑↓ navigation, Space toggle, Enter confirm.
 
-cmd_provision() {
-    local source_vm=""
-    local from_flag=""
+tui_multiselect() {
+    local -n _result=$1; shift
+    local -a labels=() descs=() states=()
+    local i=0
 
-    # Parse provision args
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --from) source_vm="$2"; shift 2 ;;
-            *) die "Unknown provision option: $1" ;;
-        esac
+    # Parse options: "label|description|on_or_off"
+    for opt in "$@"; do
+        labels+=("${opt%%|*}")
+        local rest="${opt#*|}"
+        descs+=("${rest%%|*}")
+        local default="${rest##*|}"
+        if [[ "$default" == "on" ]]; then
+            states+=("on")
+        else
+            states+=("off")
+        fi
+        i=$((i + 1))
     done
 
-    if [[ -z "$source_vm" ]]; then
-        source_vm=$(json_get "$CONFIG_FILE" "source_vm")
+    local count=${#labels[@]}
+    local cursor=0
+
+    # Hide cursor
+    printf '\033[?25l'
+
+    _tui_draw() {
+        # Move up to menu start and redraw
+        for (( j=0; j<count+1; j++ )); do
+            printf '\033[2K'
+            if (( j < count )); then
+                printf '\033[1A'
+            fi
+        done
+        printf '\r'
+
+        for (( j=0; j<count; j++ )); do
+            local prefix="  "
+            local check="${DIM}☐${NC}"
+            local label_color=""
+
+            if (( j == cursor )); then
+                prefix="${CYAN}▸${NC} "
+            fi
+
+            if [[ "${states[$((j+1))]}" == "on" ]]; then
+                check="${GREEN}☑${NC}"
+                label_color="${BOLD}"
+            fi
+
+            printf "  %b%b %b%s${NC}" "$prefix" "$check" "$label_color" "${labels[$((j+1))]}"
+            if [[ -n "${descs[$((j+1))]}" ]]; then
+                printf "  ${DIM}%s${NC}" "${descs[$((j+1))]}"
+            fi
+            printf "\n"
+        done
+        printf "\n  ${DIM}↑↓ navigate · Space toggle · Enter confirm${NC}"
+    }
+
+    # Print initial placeholder lines
+    for (( j=0; j<count; j++ )); do
+        printf "\n"
+    done
+    printf "\n"
+    _tui_draw
+
+    # Input loop
+    while true; do
+        local key
+        read -rsk1 key
+
+        case "$key" in
+            $'\e')
+                local seq
+                read -rsk2 -t 0.1 seq 2>/dev/null || true
+                case "$seq" in
+                    '[A') cursor=$(( (cursor - 1 + count) % count )) ;;
+                    '[B') cursor=$(( (cursor + 1) % count )) ;;
+                esac
+                ;;
+            ' ')
+                local idx=$((cursor + 1))
+                if [[ "${states[$idx]}" == "on" ]]; then
+                    states[$idx]="off"
+                else
+                    states[$idx]="on"
+                fi
+                ;;
+            $'\n'|'')
+                break
+                ;;
+            'q')
+                printf '\033[?25h\n'
+                return 1
+                ;;
+        esac
+
+        _tui_draw
+    done
+
+    # Collect results
+    _result=()
+    for (( j=1; j<=count; j++ )); do
+        if [[ "${states[$j]}" == "on" ]]; then
+            _result+=($((j - 1)))
+        fi
+    done
+
+    printf '\033[?25h\n'
+}
+
+# ── Sync ─────────────────────────────────────────────────────────────────────
+
+cmd_sync_internal() {
+    local name="$1"
+    local proj_path="${2:-}"
+
+    # ── Project path symlink (mirror host path inside container) ─────────
+    if [[ -n "$proj_path" ]]; then
+        local parent_dir=$(dirname "$proj_path")
+        info "Creating project path symlink..."
+        container exec "$name" -- bash -c \
+            "mkdir -p '${parent_dir}' && ln -sfn /mnt/project '${proj_path}'" \
+            2>/dev/null || warn "Project path symlink may have failed"
     fi
-    [[ -z "$source_vm" ]] && die "No source VM specified. Use --from <name> or set source_vm in config."
 
-    if ! vm_exists "$source_vm"; then
-        die "Source VM '$source_vm' not found. Available VMs:"
-        $PRLCTL list -a --no-header -o name
+    # ── Claude & AWS config symlinks ─────────────────────────────────────
+    container exec "$name" -- bash -c \
+        "ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
+         ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
+         chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.aws 2>/dev/null" \
+        2>/dev/null || warn "Config symlinks may have failed"
+
+    # ── Git config sync ──────────────────────────────────────────────────
+    info "Syncing Git configuration..."
+    local git_synced=false
+    if [[ -f "$HOME/.gitconfig" ]]; then
+        cat "$HOME/.gitconfig" | container exec -i "$name" -- \
+            bash -c "cat > /home/${DEFAULT_USER}/.gitconfig && chown ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.gitconfig" \
+            2>/dev/null && git_synced=true || warn "Failed to copy .gitconfig"
     fi
-
-    # Check for ansible
-    if ! command -v ansible-playbook &>/dev/null; then
-        die "Ansible not found. Install with: brew install ansible"
+    if [[ -f "$HOME/.gitconfig.local" ]]; then
+        cat "$HOME/.gitconfig.local" | container exec -i "$name" -- \
+            bash -c "cat > /home/${DEFAULT_USER}/.gitconfig.local && chown ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.gitconfig.local" \
+            2>/dev/null || warn "Failed to copy .gitconfig.local"
     fi
+    $git_synced && msg "Git config synced"
 
-    # Prompt for VM password and store in Keychain
-    prompt_and_store_password
-    local vm_password=$(keychain_get)
-    [[ -z "$vm_password" ]] && die "Could not retrieve password from Keychain"
-
-    # Find host SSH public key
-    local ssh_pubkey_file=""
-    local ssh_pubkey=""
-    if ssh_pubkey_file=$(find_ssh_pubkey); then
-        ssh_pubkey=$(cat "$ssh_pubkey_file")
-        info "Found SSH public key: $ssh_pubkey_file"
+    # ── GitHub auth sync ─────────────────────────────────────────────────
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
+        info "Syncing GitHub authentication..."
+        local gh_token
+        gh_token=$(gh auth token 2>/dev/null)
+        if [[ -n "$gh_token" ]]; then
+            container exec "$name" -- su - "${DEFAULT_USER}" -c \
+                "command -v gh &>/dev/null && echo '${gh_token}' | gh auth login --with-token 2>/dev/null && gh auth setup-git 2>/dev/null" \
+                2>/dev/null \
+                && msg "GitHub auth synced (gh CLI)" \
+                || warn "GitHub auth sync failed"
+        fi
     else
-        warn "No SSH public key found (~/.ssh/id_ed25519.pub, id_rsa.pub, etc.)"
-        warn "Password-based auth will be used. Consider running: ssh-keygen -t ed25519"
+        step "GitHub CLI not authenticated on host — skipping"
     fi
+}
 
-    local base=$(base_name "$source_vm")
-    msg "Provisioning base VM: $base from '$source_vm'"
+cmd_sync() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox sync <name>"
+    local name="$1"
+    container_exists "$name" || die "Sandbox '$name' not found"
+    container_running "$name" || die "Sandbox '$name' is not running"
 
-    # Clone source
-    info "Cloning '$source_vm' -> '$base'..."
-    $PRLCTL clone "$source_vm" --name "$base" || die "Clone failed"
+    local state_file=$(sandbox_state_file "$name")
+    local proj_path=""
+    [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
 
-    # Configure networking (shared = NAT, VM can reach internet but not exposed on LAN)
-    info "Setting shared networking..."
-    $PRLCTL set "$base" --device-set net0 --type shared 2>/dev/null || \
-        warn "Could not set shared networking. You may need to configure manually."
+    cmd_sync_internal "$name" "$proj_path"
+    msg "Sync complete for $name"
+}
 
-    # Start VM
-    info "Starting base VM..."
-    $PRLCTL start "$base" || die "Failed to start VM"
+# ── Code Server (on-demand) ─────────────────────────────────────────────────
 
-    wait_ssh "$base"
+install_and_start_code_server() {
+    local name="$1"
+    local ip="$2"
+    local folder="${3:-/mnt/project}"
 
-    # Get IP
-    local ip=$(vm_ip "$base")
-    [[ -z "$ip" ]] && die "Could not determine VM IP address"
-    msg "Base VM IP: $ip"
+    info "Installing code-server (on-demand)..."
+    container exec "$name" -- su - "${DEFAULT_USER}" -c \
+        "curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone 2>/dev/null" \
+        2>/dev/null || { warn "code-server installation failed"; return 1; }
 
-    # Inject SSH public key into VM before Ansible runs
-    if [[ -n "$ssh_pubkey" ]]; then
-        info "Injecting SSH public key into VM..."
-        $PRLCTL exec "$base" -- bash -c "
-            mkdir -p ~/.ssh && chmod 700 ~/.ssh
-            echo '$ssh_pubkey' >> ~/.ssh/authorized_keys
-            chmod 600 ~/.ssh/authorized_keys
-        " 2>/dev/null || warn "SSH key injection via prlctl exec failed, Ansible will use password"
-    fi
+    info "Starting code-server..."
+    container exec -d "$name" -- su - "${DEFAULT_USER}" -c \
+        "code-server --bind-addr 0.0.0.0:8080 --auth none '${folder}' &>/dev/null &" \
+        2>/dev/null || { warn "code-server start failed"; return 1; }
 
-    # Generate inventory
-    local inv_file="$CONFIG_DIR/inventory.yml"
-    local prov_dir="$SCRIPT_DIR/provisioning"
+    local elapsed=0 timeout=20
+    while (( elapsed < timeout )); do
+        if nc -z -G 2 "$ip" 8080 &>/dev/null; then
+            msg "Code Server: ${BOLD}http://${ip}:8080${NC}"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    warn "code-server not reachable after ${timeout}s"
+}
 
-    cat > "$inv_file" <<YAML
-all:
-  hosts:
-    base:
-      ansible_host: $ip
-      ansible_user: $DEFAULT_USER
-      ansible_ssh_pass: $vm_password
-      ansible_become_pass: $vm_password
-      ansible_connection: paramiko_ssh
-      ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-YAML
+# ── Commands ─────────────────────────────────────────────────────────────────
 
-    # Run Ansible (password passed via inventory)
-    # Reset file descriptors to blocking mode — prlctl/nc in wait_ssh can leave
-    # them non-blocking, which Ansible rejects.
-    python3 -c "import fcntl,os;[fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_NONBLOCK) for fd in (0,1,2)]"
-    msg "Running Ansible provisioning..."
-    if [[ -f "$prov_dir/playbook.yml" ]]; then
-        ANSIBLE_HOST_KEY_CHECKING=False \
-        ansible-playbook -i "$inv_file" "$prov_dir/playbook.yml" \
-            || die "Ansible provisioning failed"
-    else
-        die "Playbook not found at $prov_dir/playbook.yml"
-    fi
+cmd_build() {
+    [[ ! -f "$CONTAINERFILE" ]] && die "Containerfile not found at $CONTAINERFILE"
 
-    # Clean password from inventory file (SSH key is now in place)
-    cat > "$inv_file" <<YAML
-all:
-  hosts:
-    base:
-      ansible_host: $ip
-      ansible_user: $DEFAULT_USER
-      ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-YAML
-    info "Cleaned password from inventory file"
+    info "Building container image '${IMAGE_REF}'..."
+    info "Includes: Debian Bookworm, Node.js 24, Claude Code, gh, AWS CLI, SSH"
+    echo ""
 
-    # Stop VM — ready to clone
-    info "Stopping base VM..."
-    $PRLCTL stop "$base" || warn "Stop may have failed"
+    container image build -t "${IMAGE_REF}" "$SCRIPT_DIR" || die "Image build failed"
 
-    # Save to config
-    json_set "$CONFIG_FILE" "base_vm" "\"$base\""
-
-    msg "Base VM '$base' provisioned and saved. Ready for sandboxes."
+    echo ""
+    success "Image '${IMAGE_REF}' built successfully"
 }
 
 cmd_launch() {
@@ -561,17 +540,16 @@ cmd_launch() {
     local name=""
     local cpus=$DEFAULT_CPUS
     local mem=$DEFAULT_MEM
-    local no_claude=false
     local no_sync=false
     local headless=false
+    local -a extra_mounts=()
 
-    # Parse args
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)      name="$2"; shift 2 ;;
             --cpus)      cpus="$2"; shift 2 ;;
             --mem)       mem="$2"; shift 2 ;;
-            --no-claude) no_claude=true; shift ;;
+            --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
             --headless)  headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
@@ -583,291 +561,159 @@ cmd_launch() {
     proj_path=$(cd "$proj_path" 2>/dev/null && pwd -P) || die "Invalid path: $proj_path"
     [[ -z "$name" ]] && name=$(derive_name "$proj_path")
 
-    msg "Sandbox: ${BOLD}$name${NC} -> $proj_path"
+    echo ""
+    header "SRL Sandbox v${VERSION}"
+    msg "Sandbox: ${BOLD}$name${NC} → $proj_path"
 
-    if vm_exists "$name"; then
-        local vm_state=$(vm_status "$name")
-        case "$vm_state" in
-            running)
-                info "VM already running"
-                ;;
-            stopped)
-                info "Resuming stopped VM..."
-                $PRLCTL start "$name" || die "Failed to start VM"
-                wait_ssh "$name"
-                ;;
-            suspended)
-                info "Resuming suspended VM..."
-                $PRLCTL resume "$name" || die "Failed to resume VM"
-                wait_ssh "$name"
-                ;;
-            *)
-                warn "VM in unexpected state: $vm_state. Attempting start..."
-                $PRLCTL start "$name" 2>/dev/null || die "Failed to start VM"
-                wait_ssh "$name"
-                ;;
-        esac
+    ensure_image
+    ensure_dns
+
+    if container_running "$name"; then
+        info "Container already running"
+    elif container_exists "$name"; then
+        info "Starting stopped container..."
+        container start "$name" || die "Failed to start container"
+        wait_container_ssh "$name" || true
     else
-        # Create new sandbox
-        local base=$(get_base_vm)
-        info "Creating linked clone from $base..."
-        $PRLCTL clone "$base" --name "$name" --linked || die "Clone failed"
+        # ── Create new container ─────────────────────────────────────────
+        info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
 
-        # Configure resources
-        info "Setting resources: ${cpus} CPUs, ${mem}MB RAM"
-        $PRLCTL set "$name" --cpus "$cpus" --memsize "$mem" 2>/dev/null
+        mkdir -p "$HOME/.claude" "$HOME/.aws"
 
-        # Shared networking (NAT — internet access without LAN exposure)
-        $PRLCTL set "$name" --device-set net0 --type shared 2>/dev/null || true
+        local -a run_args=(
+            run -d
+            --name "$name"
+            --cpus "$cpus"
+            --memory "${mem}g"
+            --volume "${proj_path}:/mnt/project"
+            --volume "$HOME/.claude:/mnt/claude"
+            --volume "$HOME/.aws:/mnt/aws"
+        )
 
-        # Harden isolation: only explicit shared folders, clipboard, no extras
-        info "Hardening VM isolation..."
-        $PRLCTL set "$name" --smart-mount off 2>/dev/null || true
-        $PRLCTL set "$name" --shared-profile off 2>/dev/null || true
-        $PRLCTL set "$name" --shared-cloud off 2>/dev/null || true
-        $PRLCTL set "$name" --share-host-location off 2>/dev/null || true
-        $PRLCTL set "$name" --shared-clipboard on 2>/dev/null || true
+        for mount_spec in "${extra_mounts[@]}"; do
+            run_args+=(--volume "$mount_spec")
+        done
 
-        # Shared folders (project, claude config, aws creds)
-        info "Adding shared folders..."
-        $PRLCTL set "$name" --shf-host-add "project" --path "$proj_path" --mode rw 2>/dev/null || true
-        $PRLCTL set "$name" --shf-host-add "claude" --path "$HOME/.claude" --mode rw 2>/dev/null || true
-        $PRLCTL set "$name" --shf-host-add "aws" --path "$HOME/.aws" --mode rw 2>/dev/null || true
+        run_args+=("$IMAGE_REF")
 
-        # Start VM
-        info "Starting sandbox..."
-        $PRLCTL start "$name" || die "Failed to start VM"
-        wait_ssh "$name"
+        container "${run_args[@]}" || die "Failed to create container"
 
-        # Guest-side setup
+        wait_container_ssh "$name" || warn "Container started but SSH may not be ready"
+
+        inject_ssh_key "$name"
+
         if [[ "$no_sync" != true ]]; then
             cmd_sync_internal "$name" "$proj_path"
         fi
 
-        # Save state
-        save_sandbox_state "$name" "$proj_path" "$cpus" "$mem"
+        local ip=$(container_ip "$name")
+        if [[ -n "$ip" ]]; then
+            update_ssh_config "$name" "$ip"
+        fi
+
+        save_sandbox_state "$name" "$proj_path" "$cpus" "$mem" \
+            "$(IFS=','; echo "${extra_mounts[*]}")"
     fi
 
-    # Print info
-    local ip=$(vm_ip "$name")
-    msg "VM IP: ${BOLD}${ip:-unknown}${NC}"
+    # Refresh IP
+    local ip=$(container_ip "$name")
+    if [[ -n "$ip" ]]; then
+        update_ssh_config "$name" "$ip"
+        msg "Container IP: ${BOLD}${ip}${NC}"
+        msg "Hostname: ${BOLD}${name}.${DNS_DOMAIN}${NC}"
+    fi
 
     if [[ "$headless" == true ]]; then
-        # In headless mode, still start code-server silently
-        if [[ -n "$ip" ]]; then
-            start_code_server "$ip" "/media/psf/project"
-        fi
         info "Headless mode — use 'srl-sandbox ssh $name' to connect"
         return
     fi
 
-    # ── Interactive launch menu ──────────────────────────────────────────
-    # Present multi-select options unless flags override
-    local run_code_server=false
-    local run_claude=false
-    local claude_skip_perms=false
-
-    if [[ "$no_claude" == true ]]; then
-        # --no-claude flag: skip the menu, just offer code-server
-        run_code_server=true
+    # ── Interactive launch ───────────────────────────────────────────────
+    echo ""
+    if confirm_default_yes "Use defaults? (VS Code Remote SSH)"; then
+        _launch_vscode_remote "$name" "$ip"
     else
         echo ""
-        header "Launch Options"
-        printf "  ${DIM}Toggle options with their number, then press Enter to confirm.${NC}\n"
-        echo ""
+        header "Configure"
 
-        # Menu state (all start checked by default)
-        local opt_cs=true
-        local opt_claude=true
-        local opt_skip=true
+        local -a selected=()
+        tui_multiselect selected \
+            "VS Code Remote SSH|Connect host VS Code via SSH|on" \
+            "Claude Code|Launch Claude Code in terminal|off" \
+            "Skip Permissions|--dangerously-skip-permissions|off" \
+            "Code Server|Browser VS Code (installed on demand)|off" \
+            "Shell Only|Drop into zsh shell|off"
 
-        while true; do
-            # Render menu
-            local cs_mark claude_mark skip_mark
-            $opt_cs     && cs_mark="${GREEN}✔${NC}" || cs_mark="${DIM}○${NC}"
-            $opt_claude && claude_mark="${GREEN}✔${NC}" || claude_mark="${DIM}○${NC}"
-            $opt_skip   && skip_mark="${GREEN}✔${NC}" || skip_mark="${DIM}○${NC}"
+        local run_vscode=false
+        local run_claude=false
+        local run_skip_perms=false
+        local run_code_server=false
+        local run_shell=false
 
-            printf "\r\033[K  %b ${BOLD}1${NC} Code Server          %b ${BOLD}2${NC} Claude Code          %b ${BOLD}3${NC} Skip Permissions\n" \
-                "$cs_mark" "$claude_mark" "$skip_mark"
-            printf "\n  ${CYAN}Toggle [1-3] or press Enter to launch: ${NC}"
-
-            read -r choice
-            # Move cursor up to overwrite the menu for redraw
-            printf "\033[3A"
-
-            case "$choice" in
-                1) $opt_cs && opt_cs=false || opt_cs=true ;;
-                2) $opt_claude && opt_claude=false || opt_claude=true ;;
-                3) $opt_skip && opt_skip=false || opt_skip=true ;;
-                "") 
-                    # Clear the menu area and break
-                    printf "\033[3B"
-                    break
-                    ;;
-                *)
-                    # Unknown input, just redraw
-                    ;;
+        for idx in "${selected[@]}"; do
+            case $idx in
+                0) run_vscode=true ;;
+                1) run_claude=true ;;
+                2) run_skip_perms=true ;;
+                3) run_code_server=true ;;
+                4) run_shell=true ;;
             esac
         done
 
-        run_code_server=$opt_cs
-        run_claude=$opt_claude
-        claude_skip_perms=$opt_skip
-    fi
+        echo ""
 
-    # ── Execute selected options ─────────────────────────────────────────
-
-    # Code Server
-    if $run_code_server && [[ -n "$ip" ]]; then
-        start_code_server "$ip" "/media/psf/project"
-        check_local_network_access "$ip"
-    fi
-
-    # Claude Code
-    if $run_claude && [[ -n "$ip" ]]; then
-        if ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-            "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
-            echo ""
-            if $run_code_server; then
-                msg "Code Server: ${BOLD}http://${ip}:8080/?folder=/media/psf/project${NC}"
-            fi
-
-            local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd /media/psf/project && claude"
-            if $claude_skip_perms; then
-                claude_cmd+=" --dangerously-skip-permissions"
-                info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
-            else
-                info "Launching Claude Code..."
-            fi
-            echo ""
-            ssh_with_auth "${DEFAULT_USER}" "${ip}" "$claude_cmd"
-        else
-            warn "Claude Code not found in VM. Falling back to shell."
-            warn "Install with: npm install -g @anthropic-ai/claude-code"
-            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-                "cd /media/psf/project && exec zsh -l"
+        if $run_code_server && [[ -n "$ip" ]]; then
+            install_and_start_code_server "$name" "$ip"
         fi
-    elif ! $run_claude && [[ -n "$ip" ]]; then
-        # No Claude selected — open SSH shell
-        ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-            "cd /media/psf/project && exec zsh -l"
+
+        if $run_vscode; then
+            _launch_vscode_remote "$name" "$ip"
+        fi
+
+        if $run_claude; then
+            _launch_claude "$name" "$run_skip_perms"
+        elif $run_shell; then
+            _launch_shell "$name"
+        fi
     fi
 }
 
-cmd_sync_internal() {
+_launch_vscode_remote() {
     local name="$1"
-    local proj_path="${2:-}"
+    local ip="$2"
+    local remote_folder="/mnt/project"
+    local remote_uri="vscode://vscode-remote/ssh-remote+${name}${remote_folder}"
+    info "Opening VS Code → ${name}:${remote_folder}"
+    open "$remote_uri" 2>/dev/null \
+        && msg "VS Code Remote SSH launched" \
+        || warn "Failed to open VS Code. Ensure the Remote - SSH extension is installed."
+}
 
-    local ip=$(vm_ip "$name")
-    [[ -z "$ip" ]] && { warn "Cannot sync — no IP for $name"; return 1; }
+_launch_claude() {
+    local name="$1"
+    local skip_perms="$2"
 
-    local ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
-
-    info "Setting up guest-side symlinks..."
-
-    # Parallels Tools mounts shared folders at /media/psf/
-    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-        'rm -rf ~/.claude 2>/dev/null; ln -sf /media/psf/claude ~/.claude; rm -rf ~/.aws 2>/dev/null; ln -sf /media/psf/aws ~/.aws' \
-        2>/dev/null || warn "Symlink setup may have partially failed"
-
-    # Create macOS-compatible path symlink for project (needs sudo + password)
-    if [[ -n "$proj_path" ]]; then
-        local parent_dir=$(dirname "$proj_path")
-        local vm_pass=""
-        keychain_has && vm_pass=$(keychain_get)
-        if [[ -n "$vm_pass" ]]; then
-            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-                "echo '${vm_pass}' | sudo -S bash -c \"mkdir -p '${parent_dir}' && ln -sf /media/psf/project '${proj_path}' && chown -h ${DEFAULT_USER}:${DEFAULT_USER} '${proj_path}'\"" \
-                2>/dev/null || warn "Project path symlink may have failed"
+    if container exec "$name" -- su - "${DEFAULT_USER}" -c \
+        "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
+        local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd /mnt/project && claude"
+        if [[ "$skip_perms" == "true" ]]; then
+            claude_cmd+=" --dangerously-skip-permissions"
+            info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
         else
-            ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-                "sudo mkdir -p '${parent_dir}' && sudo ln -sf /media/psf/project '${proj_path}' && sudo chown -h ${DEFAULT_USER}:${DEFAULT_USER} '${proj_path}'" \
-                2>/dev/null || warn "Project path symlink may have failed (no sudo password)"
+            info "Launching Claude Code..."
         fi
-    fi
-
-    # ── Git config sync ──────────────────────────────────────────────────
-    info "Syncing Git configuration..."
-    local git_synced=false
-    if [[ -f "$HOME/.gitconfig" ]]; then
-        scp -q "${ssh_opts[@]}" "$HOME/.gitconfig" \
-            "${DEFAULT_USER}@${ip}:~/.gitconfig" 2>/dev/null \
-            && git_synced=true \
-            || warn "Failed to copy .gitconfig"
-    fi
-    if [[ -f "$HOME/.gitconfig.local" ]]; then
-        scp -q "${ssh_opts[@]}" "$HOME/.gitconfig.local" \
-            "${DEFAULT_USER}@${ip}:~/.gitconfig.local" 2>/dev/null \
-            || warn "Failed to copy .gitconfig.local"
-    fi
-    $git_synced && msg "Git config synced"
-
-    # ── VS Code settings sync to code-server ─────────────────────────────
-    local vscode_settings_dir="$HOME/Library/Application Support/Code/User"
-    local cs_user_dir="~/.local/share/code-server/User"
-
-    # Ensure code-server User directory exists on VM
-    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-        "mkdir -p ${cs_user_dir}" 2>/dev/null || true
-
-    local settings_synced=false
-    if [[ -f "${vscode_settings_dir}/settings.json" ]]; then
-        info "Syncing VS Code settings..."
-        scp -q "${ssh_opts[@]}" "${vscode_settings_dir}/settings.json" \
-            "${DEFAULT_USER}@${ip}:${cs_user_dir}/settings.json" 2>/dev/null \
-            && settings_synced=true \
-            || warn "Failed to copy VS Code settings.json"
-    fi
-    if [[ -f "${vscode_settings_dir}/keybindings.json" ]]; then
-        info "Syncing VS Code keybindings..."
-        scp -q "${ssh_opts[@]}" "${vscode_settings_dir}/keybindings.json" \
-            "${DEFAULT_USER}@${ip}:${cs_user_dir}/keybindings.json" 2>/dev/null \
-            && settings_synced=true \
-            || warn "Failed to copy VS Code keybindings.json"
-    fi
-    # Sync snippets directory if it exists
-    if [[ -d "${vscode_settings_dir}/snippets" ]]; then
-        info "Syncing VS Code snippets..."
-        scp -q -r "${ssh_opts[@]}" "${vscode_settings_dir}/snippets" \
-            "${DEFAULT_USER}@${ip}:${cs_user_dir}/" 2>/dev/null \
-            || warn "Failed to copy VS Code snippets"
-    fi
-    $settings_synced && msg "VS Code settings synced to code-server"
-
-    # ── VS Code extensions sync ──────────────────────────────────────────
-    if command -v code &>/dev/null; then
-        info "Syncing VS Code extensions..."
-        local ext_list
-        ext_list=$(code --list-extensions 2>/dev/null)
-        if [[ -n "$ext_list" ]]; then
-            local ext_count=$(echo "$ext_list" | wc -l | tr -d ' ')
-            # Build install command (batch all extensions)
-            local install_cmd="source ~/.nvm/nvm.sh 2>/dev/null; "
-            install_cmd+="echo '${ext_list}' | while IFS= read -r ext; do "
-            install_cmd+="code-server --install-extension \"\$ext\" 2>/dev/null || true; "
-            install_cmd+="done"
-            ssh_with_auth "${DEFAULT_USER}" "${ip}" "$install_cmd" 2>/dev/null \
-                && msg "Installed ${ext_count} VS Code extensions in code-server" \
-                || warn "Some extensions may have failed to install"
-        fi
+        echo ""
+        container exec -ti "$name" -- su - "${DEFAULT_USER}" -c "$claude_cmd"
     else
-        info "VS Code CLI not found on host — skipping extension sync"
+        warn "Claude Code not found in container. Falling back to shell."
+        _launch_shell "$name"
     fi
 }
 
-cmd_sync() {
-    [[ $# -lt 1 ]] && die "Usage: srl-sandbox sync <name>"
+_launch_shell() {
     local name="$1"
-    vm_exists "$name" || die "Sandbox '$name' not found"
-    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
-
-    local state_file=$(sandbox_state_file "$name")
-    local proj_path=""
-    [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
-
-    cmd_sync_internal "$name" "$proj_path"
-    msg "Sync complete for $name"
+    container exec -ti "$name" -- su - "${DEFAULT_USER}" -c \
+        "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_stop() {
@@ -878,37 +724,16 @@ cmd_stop() {
         local names=($(list_sandbox_names))
         [[ ${#names[@]} -eq 0 ]] && { info "No sandboxes found."; return; }
         for n in "${names[@]}"; do
-            if [[ "$(vm_status "$n")" == "running" ]]; then
+            if container_running "$n"; then
                 info "Stopping $n..."
-                $PRLCTL stop "$n" 2>/dev/null && msg "Stopped $n" || warn "Failed to stop $n"
+                container stop "$n" 2>/dev/null && msg "Stopped $n" || warn "Failed to stop $n"
             fi
         done
     else
-        vm_exists "$target" || die "Sandbox '$target' not found"
+        container_exists "$target" || die "Sandbox '$target' not found"
         info "Stopping $target..."
-        $PRLCTL stop "$target" || die "Failed to stop"
+        container stop "$target" || die "Failed to stop"
         msg "Stopped $target"
-    fi
-}
-
-cmd_suspend() {
-    [[ $# -lt 1 ]] && die "Usage: srl-sandbox suspend <name|all>"
-    local target="$1"
-
-    if [[ "$target" == "all" ]]; then
-        local names=($(list_sandbox_names))
-        [[ ${#names[@]} -eq 0 ]] && { info "No sandboxes found."; return; }
-        for n in "${names[@]}"; do
-            if [[ "$(vm_status "$n")" == "running" ]]; then
-                info "Suspending $n..."
-                $PRLCTL suspend "$n" 2>/dev/null && msg "Suspended $n" || warn "Failed to suspend $n"
-            fi
-        done
-    else
-        vm_exists "$target" || die "Sandbox '$target' not found"
-        info "Suspending $target..."
-        $PRLCTL suspend "$target" || die "Failed to suspend"
-        msg "Suspended $target"
     fi
 }
 
@@ -916,19 +741,21 @@ cmd_destroy() {
     [[ $# -lt 1 ]] && die "Usage: srl-sandbox destroy <name>"
     local name="$1"
 
-    vm_exists "$name" || die "Sandbox '$name' not found"
+    container_exists "$name" || die "Sandbox '$name' not found"
     confirm "Destroy sandbox '$name'? This cannot be undone." || { info "Cancelled."; return; }
 
-    local vm_state=$(vm_status "$name")
-    if [[ "$vm_state" == "running" || "$vm_state" == "suspended" ]]; then
-        info "Force-stopping VM..."
-        $PRLCTL stop "$name" --kill 2>/dev/null || true
+    if container_running "$name"; then
+        info "Stopping container first..."
+        container stop "$name" 2>/dev/null || true
+        sleep 1
     fi
 
-    info "Deleting VM..."
-    $PRLCTL delete "$name" || die "Failed to delete VM"
+    info "Deleting container..."
+    container rm "$name" 2>/dev/null || container delete "$name" 2>/dev/null \
+        || die "Failed to delete container"
 
-    # Remove state file
+    remove_ssh_config "$name"
+
     local state_file=$(sandbox_state_file "$name")
     [[ -f "$state_file" ]] && rm -f "$state_file"
 
@@ -945,38 +772,36 @@ cmd_list() {
 
     header "Sandboxes"
     printf "  ${BOLD}%-30s  %-10s  %-16s  %s${NC}\n" "NAME" "STATUS" "IP" "PROJECT"
-    printf "  ${DIM}%-30s  %-10s  %-16s  %s${NC}\n" "────────────────────────────" "─────────" "───────────────" "───────────────────────"
+    printf "  ${DIM}%-30s  %-10s  %-16s  %s${NC}\n" \
+        "────────────────────────────" "─────────" "───────────────" "───────────────────────"
 
     for name in "${names[@]}"; do
-        local vm_state="unknown"
-        local ip="-"
-        local proj_path="-"
+        local status="unknown" proj_path="-" ip="-"
 
-        if vm_exists "$name"; then
-            vm_state=$(vm_status "$name")
-            if [[ "$vm_state" == "running" ]]; then
-                ip=$(vm_ip "$name" 2>/dev/null)
-                [[ -z "$ip" ]] && ip="-"
-            fi
+        if container_running "$name"; then
+            status="running"
+            ip=$(container_ip "$name")
+            [[ -z "$ip" ]] && ip="-"
+        elif container_exists "$name"; then
+            status="stopped"
         else
-            vm_state="deleted"
+            status="deleted"
         fi
 
         local state_file=$(sandbox_state_file "$name")
         [[ -f "$state_file" ]] && proj_path=$(json_get "$state_file" "project_path")
         [[ -z "$proj_path" ]] && proj_path="-"
 
-        # Colorize status with fixed-width indicator
         local status_icon color_status
-        case "$vm_state" in
-            running)   status_icon="${GREEN}●${NC}"; color_status="${GREEN}${vm_state}${NC}" ;;
-            stopped)   status_icon="${RED}●${NC}";   color_status="${RED}${vm_state}${NC}" ;;
-            suspended) status_icon="${YELLOW}●${NC}"; color_status="${YELLOW}${vm_state}${NC}" ;;
-            deleted)   status_icon="${RED}○${NC}";   color_status="${RED}${vm_state}${NC}" ;;
-            *)         status_icon="${DIM}?${NC}";   color_status="$vm_state" ;;
+        case "$status" in
+            running) status_icon="${GREEN}●${NC}"; color_status="${GREEN}${status}${NC}" ;;
+            stopped) status_icon="${RED}●${NC}";   color_status="${RED}${status}${NC}" ;;
+            deleted) status_icon="${RED}○${NC}";   color_status="${RED}${status}${NC}" ;;
+            *)       status_icon="${DIM}?${NC}";   color_status="$status" ;;
         esac
 
-        printf "  %-30s  %b %-10b  %-16s  ${DIM}%s${NC}\n" "$name" "$status_icon" "$color_status" "$ip" "$proj_path"
+        printf "  %-30s  %b %-10b  %-16s  ${DIM}%s${NC}\n" \
+            "$name" "$status_icon" "$color_status" "$ip" "$proj_path"
     done
     echo ""
 }
@@ -984,81 +809,87 @@ cmd_list() {
 cmd_ssh() {
     [[ $# -lt 1 ]] && die "Usage: srl-sandbox ssh <name>"
     local name="$1"
-    vm_exists "$name" || die "Sandbox '$name' not found"
-    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
+    container_exists "$name" || die "Sandbox '$name' not found"
+    container_running "$name" || die "Sandbox '$name' is not running"
 
-    local ip=$(vm_ip "$name")
-    [[ -z "$ip" ]] && die "Could not determine VM IP"
-
-    ssh_with_auth "${DEFAULT_USER}" "${ip}" \
-        "cd /media/psf/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
+    container exec -ti "$name" -- su - "${DEFAULT_USER}" -c \
+        "cd /mnt/project 2>/dev/null; exec zsh -l 2>/dev/null || exec bash -l"
 }
 
 cmd_exec() {
     [[ $# -lt 2 ]] && die "Usage: srl-sandbox exec <name> <command...>"
     local name="$1"; shift
-    vm_exists "$name" || die "Sandbox '$name' not found"
-    [[ "$(vm_status "$name")" != "running" ]] && die "Sandbox '$name' is not running"
+    container_exists "$name" || die "Sandbox '$name' not found"
+    container_running "$name" || die "Sandbox '$name' is not running"
 
-    $PRLCTL exec "$name" -- "$@"
+    container exec "$name" -- su - "${DEFAULT_USER}" -c "$*"
 }
 
 cmd_info() {
     [[ $# -lt 1 ]] && die "Usage: srl-sandbox info <name>"
     local name="$1"
-    vm_exists "$name" || die "Sandbox '$name' not found"
+    container_exists "$name" || die "Sandbox '$name' not found"
 
-    local vm_state=$(vm_status "$name")
-    local ip="-"
-    [[ "$vm_state" == "running" ]] && ip=$(vm_ip "$name" 2>/dev/null)
-    [[ -z "$ip" ]] && ip="-"
+    local is_running=false
+    container_running "$name" && is_running=true
 
     local state_file=$(sandbox_state_file "$name")
-    local proj_path="-" cpus="-" mem="-" created="-"
+    local proj_path="-" cpus="-" mem="-" created="-" extra_mounts="-"
     if [[ -f "$state_file" ]]; then
         proj_path=$(json_get "$state_file" "project_path")
         cpus=$(json_get "$state_file" "cpus")
         mem=$(json_get "$state_file" "mem")
         created=$(json_get "$state_file" "created")
+        extra_mounts=$(json_get "$state_file" "extra_mounts")
     fi
 
-    # Status indicator
+    local ip="-"
+    $is_running && ip=$(container_ip "$name")
+    [[ -z "$ip" ]] && ip="-"
+
     local status_display
-    case "$vm_state" in
-        running)   status_display="${GREEN}● running${NC}" ;;
-        stopped)   status_display="${RED}● stopped${NC}" ;;
-        suspended) status_display="${YELLOW}● suspended${NC}" ;;
-        *)         status_display="${DIM}? ${vm_state}${NC}" ;;
-    esac
+    if $is_running; then
+        status_display="${GREEN}● running${NC}"
+    else
+        status_display="${RED}● stopped${NC}"
+    fi
 
     header "$name"
     printf "  ${BOLD}%-14s${NC} %b\n" "Status" "$status_display"
     printf "  ${BOLD}%-14s${NC} %s\n" "IP" "$ip"
+    printf "  ${BOLD}%-14s${NC} %s.${DNS_DOMAIN}\n" "Hostname" "$name"
     printf "  ${BOLD}%-14s${NC} %s\n" "Project" "${proj_path:-—}"
-    printf "  ${BOLD}%-14s${NC} %s vCPU · %s MB RAM\n" "Resources" "${cpus:-—}" "${mem:-—}"
+    printf "  ${BOLD}%-14s${NC} %s vCPU · %s GiB RAM\n" "Resources" "${cpus:-—}" "${mem:-—}"
     printf "  ${BOLD}%-14s${NC} %s\n" "Created" "${created:-—}"
 
     echo ""
-    printf "  ${BOLD}Shared Folders${NC}\n"
-    printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "/media/psf/project"
-    printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/media/psf/claude"
-    printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/media/psf/aws"
+    printf "  ${BOLD}Mounts${NC}\n"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "/mnt/project"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/mnt/claude → ~/.claude"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/mnt/aws → ~/.aws"
+    if [[ -n "$extra_mounts" && "$extra_mounts" != "-" ]]; then
+        IFS=',' read -rA mount_arr <<< "$extra_mounts"
+        for m in "${mount_arr[@]}"; do
+            [[ -z "$m" ]] && continue
+            printf "  ${DIM}%-12s %s${NC}\n" "extra" "$m"
+        done
+    fi
 
     echo ""
     printf "  ${BOLD}Synced Config${NC}\n"
     [[ -f "$HOME/.gitconfig" ]] \
         && printf "  ${DIM}%-12s %s${NC}\n" "git" "~/.gitconfig" \
         || printf "  ${DIM}%-12s %s${NC}\n" "git" "(not found on host)"
-    [[ -f "$HOME/Library/Application Support/Code/User/settings.json" ]] \
-        && printf "  ${DIM}%-12s %s${NC}\n" "vscode" "settings.json, keybindings.json" \
-        || printf "  ${DIM}%-12s %s${NC}\n" "vscode" "(VS Code settings not found)"
+    command -v gh &>/dev/null && gh auth status &>/dev/null \
+        && printf "  ${DIM}%-12s %s${NC}\n" "github" "gh auth token (synced)" \
+        || printf "  ${DIM}%-12s %s${NC}\n" "github" "(gh not authenticated)"
 
-    if [[ "$vm_state" == "running" && "$ip" != "-" ]]; then
+    if $is_running; then
         echo ""
         printf "  ${BOLD}Quick Access${NC}\n"
-        printf "  ${CYAN}ssh${NC}     ssh %s@%s\n" "$DEFAULT_USER" "$ip"
-        printf "  ${CYAN}http${NC}    http://%s:8080/\n" "$ip"
-        printf "  ${CYAN}claude${NC}  srl-sandbox launch (auto-connects)\n"
+        printf "  ${CYAN}ssh${NC}     ssh ${name}\n"
+        printf "  ${CYAN}vscode${NC}  code --remote ssh-remote+${name} /mnt/project\n"
+        printf "  ${CYAN}claude${NC}  srl-sandbox exec ${name} 'source ~/.nvm/nvm.sh && claude'\n"
     fi
     echo ""
 }
@@ -1066,47 +897,58 @@ cmd_info() {
 cmd_help() {
     echo ""
     printf "  ${BOLD}${CYAN}srl-sandbox${NC} ${DIM}v${VERSION}${NC}\n"
-    printf "  ${DIM}Parallels VM sandboxes for Claude Code${NC}\n"
+    printf "  ${DIM}Sandboxed dev environments using Apple Container (macOS 26+)${NC}\n"
     echo ""
     printf "  ${BOLD}Usage${NC}    srl-sandbox ${DIM}[path] [options]${NC}\n"
     printf "  ${DIM}         Running without arguments launches a sandbox for the current directory.${NC}\n"
     echo ""
     printf "  ${BOLD}Commands${NC}\n"
-    printf "    ${CYAN}launch${NC} ${DIM}[path]${NC}           Create or resume sandbox for project dir ${DIM}(default: cwd)${NC}\n"
+    printf "    ${CYAN}launch${NC} ${DIM}[path]${NC}           Create or resume sandbox ${DIM}(default: cwd)${NC}\n"
     printf "    ${CYAN}stop${NC} ${DIM}<name|all>${NC}         Stop a sandbox\n"
-    printf "    ${CYAN}suspend${NC} ${DIM}<name|all>${NC}      Suspend sandbox ${DIM}(preserves RAM state)${NC}\n"
-    printf "    ${CYAN}destroy${NC} ${DIM}<name>${NC}          Delete sandbox VM and state\n"
+    printf "    ${CYAN}destroy${NC} ${DIM}<name>${NC}          Delete container and state\n"
     printf "    ${CYAN}list${NC}                     List all sandboxes with status\n"
-    printf "    ${CYAN}ssh${NC} ${DIM}<name>${NC}              SSH into running sandbox\n"
+    printf "    ${CYAN}ssh${NC} ${DIM}<name>${NC}              Shell into running sandbox\n"
     printf "    ${CYAN}exec${NC} ${DIM}<name> <cmd>${NC}       Run command in sandbox\n"
-    printf "    ${CYAN}provision${NC}                Set up base VM template via Ansible\n"
-    printf "    ${CYAN}sync${NC} ${DIM}<name>${NC}             Re-sync settings, configs & extensions\n"
+    printf "    ${CYAN}sync${NC} ${DIM}<name>${NC}             Re-sync settings & configs\n"
     printf "    ${CYAN}info${NC} ${DIM}<name>${NC}             Show sandbox details\n"
+    printf "    ${CYAN}build${NC}                    Rebuild container image\n"
+    printf "    ${CYAN}help${NC}                     Show this help\n"
     echo ""
     printf "  ${BOLD}Launch Options${NC}\n"
     printf "    ${CYAN}--name${NC} ${DIM}<name>${NC}           Override auto-generated name\n"
     printf "    ${CYAN}--cpus${NC} ${DIM}<n>${NC}              CPU cores ${DIM}(default: $DEFAULT_CPUS)${NC}\n"
-    printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in MB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
-    printf "    ${CYAN}--no-claude${NC}              Don't auto-launch Claude Code\n"
+    printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
+    printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
-    printf "    ${CYAN}--headless${NC}               Don't open terminal after launch\n"
+    printf "    ${CYAN}--headless${NC}               Don't open terminal/editor after launch\n"
     echo ""
-    printf "  ${BOLD}Provision Options${NC}\n"
-    printf "    ${CYAN}--from${NC} ${DIM}<vm-name>${NC}        Source VM to clone ${DIM}(default: from config)${NC}\n"
+    printf "  ${BOLD}Interactive Menu${NC}\n"
+    printf "    On launch, choose defaults (VS Code Remote SSH) or configure:\n"
+    printf "    ${DIM}·${NC} VS Code Remote SSH — connect host VS Code via SSH\n"
+    printf "    ${DIM}·${NC} Claude Code — interactive AI coding agent\n"
+    printf "    ${DIM}·${NC} Skip Permissions — adds --dangerously-skip-permissions\n"
+    printf "    ${DIM}·${NC} Code Server — browser-based VS Code (installed on demand)\n"
+    printf "    ${DIM}·${NC} Shell Only — drop into zsh shell\n"
     echo ""
-    printf "  ${BOLD}Sync Details${NC}\n"
-    printf "    On launch/sync, the following are copied to the VM:\n"
-    printf "    ${DIM}·${NC} ~/.gitconfig, ~/.gitconfig.local\n"
-    printf "    ${DIM}·${NC} VS Code settings.json, keybindings.json, snippets/\n"
-    printf "    ${DIM}·${NC} VS Code extensions ${DIM}(installed in code-server)${NC}\n"
+    printf "  ${BOLD}DNS & Networking${NC}\n"
+    printf "    Each container gets a hostname: ${BOLD}<name>.${DNS_DOMAIN}${NC}\n"
+    printf "    Direct IP access — no port forwarding needed.\n"
+    printf "    SSH config auto-managed in ~/.ssh/config\n"
+    echo ""
+    printf "  ${BOLD}Requirements${NC}\n"
+    printf "    ${DIM}·${NC} macOS 26+ (Tahoe) with Apple Silicon\n"
+    printf "    ${DIM}·${NC} Apple Container CLI (${CYAN}https://github.com/apple/container${NC})\n"
+    printf "    ${DIM}·${NC} VS Code with Remote - SSH extension\n"
     echo ""
     printf "  ${BOLD}Examples${NC}\n"
-    printf "    ${DIM}\$${NC} srl-sandbox provision --from \"Debian GNU Linux 12.11 ARM64\"\n"
-    printf "    ${DIM}\$${NC} srl-sandbox launch ~/Projects/myapp\n"
-    printf "    ${DIM}\$${NC} srl-sandbox launch --cpus 4 --mem 8192 --headless\n"
-    printf "    ${DIM}\$${NC} srl-sandbox list\n"
-    printf "    ${DIM}\$${NC} srl-sandbox ssh srl-myapp-a1b2\n"
-    printf "    ${DIM}\$${NC} srl-sandbox stop all\n"
+    printf "    ${DIM}\$${NC} srl-sandbox                              # sandbox for cwd\n"
+    printf "    ${DIM}\$${NC} srl-sandbox launch ~/Projects/myapp      # specific directory\n"
+    printf "    ${DIM}\$${NC} srl-sandbox launch --cpus 4 --mem 8      # custom resources\n"
+    printf "    ${DIM}\$${NC} srl-sandbox launch --mount ~/data:/data   # extra mount\n"
+    printf "    ${DIM}\$${NC} srl-sandbox list                          # list sandboxes\n"
+    printf "    ${DIM}\$${NC} srl-sandbox ssh srl-myapp-a1b2            # shell access\n"
+    printf "    ${DIM}\$${NC} srl-sandbox stop all                      # stop everything\n"
+    printf "    ${DIM}\$${NC} srl-sandbox build                         # rebuild image\n"
     echo ""
 }
 
@@ -1114,7 +956,7 @@ cmd_help() {
 
 trap_handler() {
     echo ""
-    warn "Interrupted. Note: any running VMs are still active."
+    warn "Interrupted. Running containers are still active."
     warn "Use 'srl-sandbox list' to see running sandboxes."
     exit 130
 }
@@ -1125,26 +967,24 @@ trap trap_handler INT
 main() {
     init_config
 
-    # No arguments → launch sandbox for current directory
-    [[ $# -eq 0 ]] && { check_parallels; cmd_launch; return; }
+    [[ $# -eq 0 ]] && { check_container_cli; cmd_launch; return; }
 
     local cmd="$1"; shift
 
     case "$cmd" in
-        launch)    check_parallels; cmd_launch "$@" ;;
-        stop)      check_parallels; cmd_stop "$@" ;;
-        suspend)   check_parallels; cmd_suspend "$@" ;;
-        destroy)   check_parallels; cmd_destroy "$@" ;;
-        list)      check_parallels; cmd_list "$@" ;;
-        ssh)       check_parallels; cmd_ssh "$@" ;;
-        exec)      check_parallels; cmd_exec "$@" ;;
-        provision) check_parallels; cmd_provision "$@" ;;
-        sync)      check_parallels; cmd_sync "$@" ;;
-        info)      check_parallels; cmd_info "$@" ;;
-        help|--help|-h) cmd_help ;;
+        launch)            check_container_cli; cmd_launch "$@" ;;
+        stop)              check_container_cli; cmd_stop "$@" ;;
+        destroy)           check_container_cli; cmd_destroy "$@" ;;
+        list)              check_container_cli; cmd_list "$@" ;;
+        ssh)               check_container_cli; cmd_ssh "$@" ;;
+        exec)              check_container_cli; cmd_exec "$@" ;;
+        sync)              check_container_cli; cmd_sync "$@" ;;
+        info)              check_container_cli; cmd_info "$@" ;;
+        build)             check_container_cli; cmd_build "$@" ;;
+        help|--help|-h)    cmd_help ;;
         version|--version|-v) echo "srl-sandbox v${VERSION}" ;;
-        -*)        check_parallels; cmd_launch "$cmd" "$@" ;;
-        *)         check_parallels; cmd_launch "$cmd" "$@" ;;
+        -*)                check_container_cli; cmd_launch "$cmd" "$@" ;;
+        *)                 check_container_cli; cmd_launch "$cmd" "$@" ;;
     esac
 }
 

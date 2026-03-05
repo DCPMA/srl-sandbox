@@ -1,7 +1,0 @@
----
-all:
-  hosts:
-    base:
-      ansible_host: __VM_IP__
-      ansible_user: parallels
-      ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
