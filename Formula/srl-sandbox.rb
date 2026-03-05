@@ -1,16 +1,11 @@
 # typed: false
 # frozen_string_literal: true
 
-# Homebrew formula for srl-sandbox
-# Install: brew install --formula Formula/srl-sandbox.rb
-# Or via tap: brew tap <user>/srl-sandbox <repo-url> && brew install srl-sandbox
 class SrlSandbox < Formula
   desc "Sandboxed dev environments using Apple Container (macOS 26+)"
   homepage "https://github.com/DCPMA/srl-sandbox"
-  # For GitHub releases, replace with the release tarball URL:
-  # url "https://github.com/<user>/srl-sandbox/archive/refs/tags/v2.0.0.tar.gz"
-  url "file:///tmp/srl-sandbox-2.0.0.tar.gz"
-  sha256 "7315cac8e304bf9e982ed4391e8a30096e42ff10ba981a3571b0a97efa13261e"
+  url "https://github.com/DCPMA/srl-sandbox/archive/refs/tags/v2.0.0.tar.gz"
+  sha256 "c3c4dfdb0db57704804930558eb94c2ac8b2d0d4a9866a2c2a6e242c267554bb"
   license "MIT"
 
   head "https://github.com/DCPMA/srl-sandbox.git", branch: "main"
