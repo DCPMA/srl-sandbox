@@ -87,6 +87,25 @@ Use `-d` to launch detached (headless).
 | `~/.aws`          | `/home/dev/.aws` (via mount) |
 | `~/.gitconfig`    | `/home/dev/.gitconfig`       |
 
+## Platform Dependencies
+
+When a project is mounted from macOS into the Linux sandbox, platform-specific artifacts (native Node modules, Python venvs) won't work. **srl-sandbox** handles this automatically:
+
+1. **Auto-detects** project ecosystems by checking for `package.json`, `requirements.txt`, `pyproject.toml`, etc.
+2. **Creates shadow overlays** — container-local directories bind-mounted over the host's `node_modules`/`.venv`, keeping host files untouched
+3. **Installs dependencies** fresh for Linux inside the shadow directories
+4. **Restores overlays** automatically when a stopped sandbox is restarted
+5. **Cleans up** macOS artifacts (`.DS_Store`, `__pycache__`, `*.pyc`)
+
+To skip this: `srl-sandbox --no-deps`
+
+### Supported Ecosystems
+
+| Ecosystem | Detected By | Shadow Directory |
+|-----------|-------------|-----------------|
+| Node.js   | `package.json` | `node_modules/` |
+| Python    | `requirements.txt`, `pyproject.toml`, `Pipfile`, `setup.py` | `.venv/` or `venv/` |
+
 ## License
 
 MIT
