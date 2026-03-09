@@ -72,6 +72,7 @@ _srl-sandbox() {
                 '--mem[RAM in GiB]:memory:(2 4 8 16 32)' \
                 '*--mount[Mount extra directory (host\:guest)]:mount spec:' \
                 '--no-sync[Skip settings sync]' \
+                '--mirror[Auto-detect and install platform-native dependencies]' \
                 '--headless[Detach after launch]' \
                 '(-d --detach)'{-d,--detach}'[Detach after launch]' \
                 '*:project path:_directories'

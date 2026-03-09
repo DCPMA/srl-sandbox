@@ -546,6 +546,178 @@ cmd_sync() {
     msg "Sync complete for $name"
 }
 
+# ── Platform Dependency Shadow Overlay ───────────────────────────────────────
+# Auto-detects project ecosystems and creates container-local bind mounts
+# over platform-specific directories (node_modules, .venv) so macOS artifacts
+# don't interfere with the Linux sandbox.
+
+readonly SHADOW_BASE="/home/${DEFAULT_USER}/.sandbox-deps"
+
+detect_ecosystems() {
+    local name="$1" guest_project="$2"
+    local -a found=()
+
+    if container exec "$name" test -f "${guest_project}/package.json" 2>/dev/null; then
+        found+=(node)
+    fi
+
+    if container exec "$name" bash -c \
+        "test -f '${guest_project}/requirements.txt' || \
+         test -f '${guest_project}/pyproject.toml' || \
+         test -f '${guest_project}/Pipfile' || \
+         test -f '${guest_project}/setup.py' || \
+         test -f '${guest_project}/setup.cfg'" 2>/dev/null; then
+        found+=(python)
+    fi
+
+    echo "${found[*]}"
+}
+
+setup_node_shadow() {
+    local name="$1" guest_project="$2" shadow_dir="$3"
+    local shadow_nm="${shadow_dir}/node_modules"
+
+    info "Setting up Node.js dependencies (Linux)..."
+
+    container exec "$name" bash -c "
+        set -e
+        mkdir -p '${shadow_nm}'
+        chown ${DEFAULT_USER}:${DEFAULT_USER} '${shadow_nm}'
+        mkdir -p '${guest_project}/node_modules'
+        mount --bind '${shadow_nm}' '${guest_project}/node_modules'
+    " || { warn "Node.js shadow overlay failed"; return 1; }
+
+    container exec "$name" su - "${DEFAULT_USER}" -c "
+        set -o pipefail
+        export NVM_DIR=\"\$HOME/.nvm\"
+        [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+        cd '${guest_project}' && npm install 2>&1 | tail -5
+    " && msg "Node.js dependencies installed" \
+        || warn "npm install failed — run manually inside sandbox"
+}
+
+setup_python_shadow() {
+    local name="$1" guest_project="$2" shadow_dir="$3"
+
+    # Detect existing venv directory name on the host mount
+    local venv_name=".venv"
+    for candidate in .venv venv; do
+        if container exec "$name" test -d "${guest_project}/${candidate}" 2>/dev/null; then
+            venv_name="$candidate"
+            break
+        fi
+    done
+
+    local shadow_venv="${shadow_dir}/${venv_name}"
+    local target_venv="${guest_project}/${venv_name}"
+
+    info "Setting up Python environment (Linux)..."
+
+    container exec "$name" bash -c "
+        set -e
+        mkdir -p '${shadow_venv}'
+        chown ${DEFAULT_USER}:${DEFAULT_USER} '${shadow_venv}'
+        mkdir -p '${target_venv}'
+        mount --bind '${shadow_venv}' '${target_venv}'
+    " || { warn "Python shadow overlay failed"; return 1; }
+
+    container exec "$name" su - "${DEFAULT_USER}" -c "
+        cd '${guest_project}'
+        python3 -m venv '${target_venv}'
+        . '${target_venv}/bin/activate'
+        pip install --upgrade pip -q
+        if [ -f requirements.txt ]; then
+            pip install -r requirements.txt -q
+        elif [ -f pyproject.toml ]; then
+            if ! pip install -e '.[dev]' -q 2>&1; then
+                echo 'dev extras failed, installing base only' >&2
+                pip install -e . -q
+            fi
+        elif [ -f Pipfile ]; then
+            pip install pipenv -q && pipenv install --dev
+        elif [ -f setup.py ] || [ -f setup.cfg ]; then
+            pip install -e . -q
+        fi
+    " && msg "Python environment ready" \
+        || warn "Python setup incomplete — run manually inside sandbox"
+}
+
+cleanup_platform_artifacts() {
+    local name="$1" guest_project="$2"
+
+    step "Cleaning macOS artifacts..."
+    container exec "$name" su - "${DEFAULT_USER}" -c "
+        cd '${guest_project}'
+        find . -name '.DS_Store' -delete 2>/dev/null
+        find . -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null
+        find . -name '*.pyc' -delete 2>/dev/null
+    " 2>/dev/null || true
+}
+
+setup_shadow_deps() {
+    local name="$1" guest_project="$2"
+    local proj_name=$(basename "$guest_project")
+    local shadow_dir="${SHADOW_BASE}/${proj_name}"
+
+    info "Detecting project dependencies..."
+    local ecosystems
+    ecosystems=$(detect_ecosystems "$name" "$guest_project")
+
+    if [[ -z "$ecosystems" ]]; then
+        step "No dependency ecosystems detected"
+        cleanup_platform_artifacts "$name" "$guest_project"
+        return 0
+    fi
+
+    msg "Detected: ${BOLD}${ecosystems}${NC}"
+
+    container exec "$name" su - "${DEFAULT_USER}" -c \
+        "mkdir -p '${shadow_dir}'" \
+        || { warn "Failed to create shadow directory '${shadow_dir}'"; return 0; }
+
+    for eco in ${=ecosystems}; do
+        case "$eco" in
+            node)   setup_node_shadow "$name" "$guest_project" "$shadow_dir" || true ;;
+            python) setup_python_shadow "$name" "$guest_project" "$shadow_dir" || true ;;
+        esac
+    done
+
+    cleanup_platform_artifacts "$name" "$guest_project"
+}
+
+restore_shadow_deps() {
+    local name="$1" guest_project="$2"
+    local proj_name=$(basename "$guest_project")
+    local shadow_dir="${SHADOW_BASE}/${proj_name}"
+
+    container exec "$name" test -d "$shadow_dir" 2>/dev/null || return 0
+
+    info "Restoring dependency overlays..."
+
+    if container exec "$name" test -d "${shadow_dir}/node_modules" 2>/dev/null; then
+        container exec "$name" bash -c "
+            set -e
+            mkdir -p '${guest_project}/node_modules'
+            chown ${DEFAULT_USER}:${DEFAULT_USER} '${guest_project}/node_modules'
+            mount --bind '${shadow_dir}/node_modules' '${guest_project}/node_modules'
+        " && msg "Node.js overlay restored" \
+            || warn "Node.js overlay restore failed"
+    fi
+
+    for candidate in .venv venv; do
+        if container exec "$name" test -d "${shadow_dir}/${candidate}" 2>/dev/null; then
+            container exec "$name" bash -c "
+                set -e
+                mkdir -p '${guest_project}/${candidate}'
+                chown ${DEFAULT_USER}:${DEFAULT_USER} '${guest_project}/${candidate}'
+                mount --bind '${shadow_dir}/${candidate}' '${guest_project}/${candidate}'
+            " && msg "Python overlay restored" \
+                || warn "Python overlay restore failed"
+            break
+        fi
+    done
+}
+
 # ── VS Code Extension & Settings Sync ───────────────────────────────────────
 
 _find_remote_code_server() {
@@ -742,6 +914,7 @@ cmd_launch() {
     local cpus=$DEFAULT_CPUS
     local mem=$DEFAULT_MEM
     local no_sync=false
+    local mirror=false
     local headless=false
     local -a extra_mounts=()
 
@@ -752,6 +925,7 @@ cmd_launch() {
             --mem)       mem="$2"; shift 2 ;;
             --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
+            --mirror)    mirror=true; shift ;;
             --headless|--detach|-d) headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
             *)           proj_path="$1"; shift ;;
@@ -764,6 +938,7 @@ cmd_launch() {
     validate_name "$name"
 
     local proj_dirname=$(basename "$proj_path")
+    [[ "$proj_dirname" == *"'"* ]] && die "Project directory name contains unsupported characters (single quote)"
     local guest_project="/home/${DEFAULT_USER}/${proj_dirname}"
 
     # Load guest_project from state if the sandbox already exists
@@ -786,6 +961,10 @@ cmd_launch() {
         info "Starting stopped container..."
         container start "$name" || die "Failed to start container"
         wait_container_ssh "$name" || true
+        # Restore bind-mount overlays from previous session
+        if [[ "$mirror" == true ]]; then
+            restore_shadow_deps "$name" "$guest_project"
+        fi
     else
         # ── Create new container ─────────────────────────────────────────
         info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
@@ -814,6 +993,11 @@ cmd_launch() {
 
         if [[ "$no_sync" != true ]]; then
             cmd_sync_internal "$name" "$proj_path" "$guest_project"
+        fi
+
+        # Set up platform-native dependencies via shadow overlay
+        if [[ "$mirror" == true ]]; then
+            setup_shadow_deps "$name" "$guest_project"
         fi
 
         local ip=$(container_ip "$name")
@@ -1275,6 +1459,7 @@ cmd_help() {
     printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
     printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
+    printf "    ${CYAN}--mirror${NC}                 Auto-detect and install platform-native dependencies\n"
     printf "    ${CYAN}--headless${NC} / ${CYAN}-d${NC}          Detach: don't open editor or wait in foreground\n"
     echo ""
     printf "  ${BOLD}Interactive Menu${NC}\n"
