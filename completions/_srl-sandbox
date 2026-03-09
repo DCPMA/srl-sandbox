@@ -24,6 +24,43 @@ _srl_sandbox_names_or_all() {
     _describe 'sandbox name' completions
 }
 
+_srl_sandbox_running() {
+    local -a names
+    names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
+    names=("${(@)names:#}")
+    [[ ${#names} -eq 0 ]] && return
+    _describe 'running sandbox' names
+}
+
+_srl_sandbox_stopped() {
+    local -a all running stopped
+    local dir="$HOME/.config/srl-sandbox/sandboxes"
+    [[ -d "$dir" ]] || return
+    all=("${(@f)$(ls "$dir"/*.json 2>/dev/null | xargs -I{} basename {} .json)}")
+    all=("${(@)all:#}")
+    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
+    running=("${(@)running:#}")
+    local name
+    for name in "${all[@]}"; do
+        (( ${running[(Ie)$name]} )) || stopped+=("$name")
+    done
+    [[ ${#stopped} -eq 0 ]] && return
+    _describe 'stopped sandbox' stopped
+}
+
+_srl_sandbox_running_or_all() {
+    local -a completions
+    completions=("all:All sandboxes")
+    local name
+    local -a running
+    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
+    running=("${(@)running:#}")
+    for name in "${running[@]}"; do
+        completions+=("$name:Running sandbox")
+    done
+    _describe 'sandbox name' completions
+}
+
 _srl-sandbox() {
     local -a commands
     commands=(
@@ -38,6 +75,7 @@ _srl-sandbox() {
         'info:Show sandbox details'
         'build:Rebuild container image'
         'reset:Remove base image (--all to destroy all sandboxes too)'
+        'resize:Change memory/CPU for an existing sandbox'
         'help:Show help text'
         'version:Show version'
     )
@@ -50,24 +88,29 @@ _srl-sandbox() {
     case "${words[2]}" in
         stop)
             if (( CURRENT == 3 )); then
-                _srl_sandbox_names_or_all
+                _srl_sandbox_running_or_all
             fi
             ;;
-        destroy|ssh|sync|sync-extensions|info)
+        destroy|info|resize)
             if (( CURRENT == 3 )); then
                 _srl_sandbox_names
+            fi
+            ;;
+        ssh|sync|sync-extensions)
+            if (( CURRENT == 3 )); then
+                _srl_sandbox_running
             fi
             ;;
         exec)
             if (( CURRENT == 3 )); then
-                _srl_sandbox_names
+                _srl_sandbox_running
             elif (( CURRENT >= 4 )); then
                 _command_names
             fi
             ;;
         launch)
             _arguments \
-                '--name[Override sandbox name]:name:' \
+                '--name[Resume existing sandbox]:name:_srl_sandbox_stopped' \
                 '--cpus[CPU cores]:cores:(1 2 4 8)' \
                 '--mem[RAM in GiB]:memory:(2 4 8 16 32)' \
                 '*--mount[Mount extra directory (host\:guest)]:mount spec:' \

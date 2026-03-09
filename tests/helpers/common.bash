@@ -15,6 +15,15 @@ MOCKS_DIR="${TESTS_DIR}/mocks"
 # Minimal PATH for subshell: mocks dir + standard system paths
 SYSTEM_PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Lightweight mock setup for completion tests
+setup_mocks() {
+    export PATH="$MOCKS_DIR:$PATH"
+    export TMPDIR="${TMPDIR:-/tmp}"
+    export CONTAINER_CALLS_LOG="${TMPDIR}/container_calls.log"
+    rm -f "${CONTAINER_CALLS_LOG}"
+    touch "${CONTAINER_CALLS_LOG}"
+}
+
 setup_sandbox_env() {
     # Create temp dir for this test
     export TEST_TMPDIR

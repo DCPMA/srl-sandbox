@@ -1065,7 +1065,7 @@ cmd_launch() {
     fi
 
     # ── Lifecycle: stop sandbox when CLI exits ───────────────────────────
-    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; trap - EXIT HUP TERM INT" EXIT HUP TERM INT
+    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; trap - EXIT HUP TERM INT; exit 0" EXIT HUP TERM INT
 
     # ── Interactive launch ───────────────────────────────────────────────
     echo ""
