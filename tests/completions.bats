@@ -64,9 +64,9 @@ source '${COMPLETION_FILE}'
 # Override container to return mock data
 container() {
     if [[ \"\$1\" == 'list' ]]; then
-        printf 'NAME\tSTATUS\tIMAGE\n'
-        printf 'sandbox1\trunning\timg\n'
-        printf 'sandbox2\trunning\timg\n'
+        printf 'ID\tIMAGE\tOS\tARCH\tSTATE\tADDR\tCPUS\tMEMORY\tSTARTED\n'
+        printf 'sandbox1\timg\tlinux\tarm64\trunning\t192.168.64.2\t4\t4G\t2024-01-01\n'
+        printf 'sandbox2\timg\tlinux\tarm64\trunning\t192.168.64.3\t4\t4G\t2024-01-01\n'
     fi
 }
 
@@ -94,8 +94,8 @@ source '${COMPLETION_FILE}'
 # Override container: alpha is running
 container() {
     if [[ \"\$1\" == 'list' ]]; then
-        printf 'NAME\tSTATUS\tIMAGE\n'
-        printf 'alpha\trunning\timg\n'
+        printf 'ID\tIMAGE\tOS\tARCH\tSTATE\tADDR\tCPUS\tMEMORY\tSTARTED\n'
+        printf 'alpha\timg\tlinux\tarm64\trunning\t192.168.64.2\t4\t4G\t2024-01-01\n'
     fi
 }
 
@@ -124,8 +124,8 @@ source '${COMPLETION_FILE}'
 
 container() {
     if [[ \"\$1\" == 'list' ]]; then
-        printf 'NAME\tSTATUS\tIMAGE\n'
-        printf 'mybox\trunning\timg\n'
+        printf 'ID\tIMAGE\tOS\tARCH\tSTATE\tADDR\tCPUS\tMEMORY\tSTARTED\n'
+        printf 'mybox\timg\tlinux\tarm64\trunning\t192.168.64.2\t4\t4G\t2024-01-01\n'
     fi
 }
 
@@ -142,11 +142,11 @@ _srl_sandbox_running_or_all
 @test "_srl_sandbox_running handles empty container list gracefully" {
     run zsh << 'ZSH_EOF'
     _describe() { shift; printf '%s\n' "$@"; }
-    container() { echo "NAME  STATUS  IMAGE"; }  # header only, no containers
+    container() { echo "ID  IMAGE  OS  ARCH  STATE  ADDR  CPUS  MEMORY  STARTED"; }  # header only, no containers
 
     _srl_sandbox_running() {
         local -a names
-        names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')}")
+        names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
         names=("${(@)names:#}")
         [[ ${#names} -eq 0 ]] && return
         _describe 'running sandbox' names

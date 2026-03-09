@@ -26,7 +26,7 @@ _srl_sandbox_names_or_all() {
 
 _srl_sandbox_running() {
     local -a names
-    names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')}")
+    names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
     names=("${(@)names:#}")
     [[ ${#names} -eq 0 ]] && return
     _describe 'running sandbox' names
@@ -38,7 +38,7 @@ _srl_sandbox_stopped() {
     [[ -d "$dir" ]] || return
     all=("${(@f)$(ls "$dir"/*.json 2>/dev/null | xargs -I{} basename {} .json)}")
     all=("${(@)all:#}")
-    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')}")
+    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
     running=("${(@)running:#}")
     local name
     for name in "${all[@]}"; do
@@ -53,7 +53,7 @@ _srl_sandbox_running_or_all() {
     completions=("all:All sandboxes")
     local name
     local -a running
-    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')}")
+    running=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $5=="running" {print $1}')}")
     running=("${(@)running:#}")
     for name in "${running[@]}"; do
         completions+=("$name:Running sandbox")
