@@ -4,8 +4,8 @@
 class SrlSandbox < Formula
   desc "Sandboxed dev environments using Apple Container (macOS 26+)"
   homepage "https://github.com/DCPMA/srl-sandbox"
-  url "https://github.com/DCPMA/srl-sandbox/archive/refs/tags/v2.4.0.tar.gz"
-  sha256 "0d9794631f6a658144799198633c79a6d76bfca6979cddcab5d3a38086105e69"
+  url "https://github.com/DCPMA/srl-sandbox/archive/refs/tags/v2.5.0.tar.gz"
+  sha256 "af3c4d04d18218e7920ab59a42a790ed52316b7baece0349ac2f849589887a47"
   license "MIT"
 
   head "https://github.com/DCPMA/srl-sandbox.git", branch: "main"
