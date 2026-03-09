@@ -588,6 +588,7 @@ setup_node_shadow() {
     " || { warn "Node.js shadow overlay failed"; return 1; }
 
     container exec "$name" su - "${DEFAULT_USER}" -c "
+        set -o pipefail
         export NVM_DIR=\"\$HOME/.nvm\"
         [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
         cd '${guest_project}' && npm install 2>&1 | tail -5
@@ -634,6 +635,8 @@ setup_python_shadow() {
             fi
         elif [ -f Pipfile ]; then
             pip install pipenv -q && pipenv install --dev
+        elif [ -f setup.py ] || [ -f setup.cfg ]; then
+            pip install -e . -q
         fi
     " && msg "Python environment ready" \
         || warn "Python setup incomplete — run manually inside sandbox"
@@ -935,6 +938,7 @@ cmd_launch() {
     validate_name "$name"
 
     local proj_dirname=$(basename "$proj_path")
+    [[ "$proj_dirname" == *"'"* ]] && die "Project directory name contains unsupported characters (single quote)"
     local guest_project="/home/${DEFAULT_USER}/${proj_dirname}"
 
     # Load guest_project from state if the sandbox already exists
