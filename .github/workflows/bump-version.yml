@@ -19,7 +19,7 @@ permissions:
 jobs:
   bump:
     name: Bump & Release
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,12 +27,14 @@ jobs:
 
       - name: Calculate new version
         id: calc
+        env:
+          BUMP: ${{ inputs.bump }}
         run: |
           current=$(grep -o 'VERSION="[^"]*"' srl-sandbox | head -1 | sed 's/VERSION="//;s/"//')
           echo "Current: $current"
 
           IFS='.' read -r major minor patch <<< "$current"
-          case "${{ inputs.bump }}" in
+          case "$BUMP" in
             major) major=$((major + 1)); minor=0; patch=0 ;;
             minor) minor=$((minor + 1)); patch=0 ;;
             patch) patch=$((patch + 1)) ;;
@@ -44,26 +46,30 @@ jobs:
           echo "new=$new" >> "$GITHUB_OUTPUT"
 
       - name: Update VERSION in script
-        run: |
-          sed -i '' "s/VERSION=\"${{ steps.calc.outputs.current }}\"/VERSION=\"${{ steps.calc.outputs.new }}\"/" srl-sandbox
+        env:
+          CURRENT: ${{ steps.calc.outputs.current }}
+          NEW: ${{ steps.calc.outputs.new }}
+        run: sed -i "s/VERSION=\"${CURRENT}\"/VERSION=\"${NEW}\"/" srl-sandbox
 
       - name: Create PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.calc.outputs.new }}
+          CURRENT: ${{ steps.calc.outputs.current }}
         run: |
-          branch="release/v${{ steps.calc.outputs.new }}"
+          branch="release/v${NEW}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add srl-sandbox
-          git commit -m "chore: bump version to ${{ steps.calc.outputs.new }}"
+          git commit -m "chore: bump version to ${NEW}"
           git push origin "$branch"
 
           gh pr create \
-            --title "Release v${{ steps.calc.outputs.new }}" \
-            --body "Bumps VERSION from ${{ steps.calc.outputs.current }} to ${{ steps.calc.outputs.new }}.
+            --title "Release v${NEW}" \
+            --body "Bumps VERSION from ${CURRENT} to ${NEW}.
 
-          Merging this PR will automatically create the \`v${{ steps.calc.outputs.new }}\` tag and trigger the release workflow." \
+Merging this PR will automatically create the \`v${NEW}\` tag, publish the GitHub Release, and update the Homebrew formula." \
             --base main \
             --head "$branch" \
             --label "release"
