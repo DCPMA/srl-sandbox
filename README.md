@@ -97,13 +97,13 @@ When a project is mounted from macOS into the Linux sandbox, platform-specific a
 4. **Re-mounts overlays** automatically when a stopped sandbox is restarted (does not reinstall)
 5. **Cleans up** macOS artifacts (`.DS_Store`, `__pycache__`, `*.pyc`)
 
-To skip this: `srl-sandbox --no-deps`
+To enable this: `srl-sandbox --mirror`
 
 ### Supported Ecosystems
 
-| Ecosystem | Detected By | Shadow Directory |
-|-----------|-------------|-----------------|
-| Node.js   | `package.json` | `node_modules/` |
+| Ecosystem | Detected By                                                              | Shadow Directory    |
+| --------- | ------------------------------------------------------------------------ | ------------------- |
+| Node.js   | `package.json`                                                           | `node_modules/`     |
 | Python    | `requirements.txt`, `pyproject.toml`, `Pipfile`, `setup.py`, `setup.cfg` | `.venv/` or `venv/` |
 
 ## License

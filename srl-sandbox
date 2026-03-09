@@ -914,7 +914,7 @@ cmd_launch() {
     local cpus=$DEFAULT_CPUS
     local mem=$DEFAULT_MEM
     local no_sync=false
-    local no_deps=false
+    local mirror=false
     local headless=false
     local -a extra_mounts=()
 
@@ -925,7 +925,7 @@ cmd_launch() {
             --mem)       mem="$2"; shift 2 ;;
             --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
-            --no-deps)   no_deps=true; shift ;;
+            --mirror)    mirror=true; shift ;;
             --headless|--detach|-d) headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
             *)           proj_path="$1"; shift ;;
@@ -962,7 +962,7 @@ cmd_launch() {
         container start "$name" || die "Failed to start container"
         wait_container_ssh "$name" || true
         # Restore bind-mount overlays from previous session
-        if [[ "$no_deps" != true ]]; then
+        if [[ "$mirror" == true ]]; then
             restore_shadow_deps "$name" "$guest_project"
         fi
     else
@@ -996,7 +996,7 @@ cmd_launch() {
         fi
 
         # Set up platform-native dependencies via shadow overlay
-        if [[ "$no_deps" != true ]]; then
+        if [[ "$mirror" == true ]]; then
             setup_shadow_deps "$name" "$guest_project"
         fi
 
@@ -1459,7 +1459,7 @@ cmd_help() {
     printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
     printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
-    printf "    ${CYAN}--no-deps${NC}               Skip auto-detecting and installing dependencies\n"
+    printf "    ${CYAN}--mirror${NC}                 Auto-detect and install platform-native dependencies\n"
     printf "    ${CYAN}--headless${NC} / ${CYAN}-d${NC}          Detach: don't open editor or wait in foreground\n"
     echo ""
     printf "  ${BOLD}Interactive Menu${NC}\n"
