@@ -959,16 +959,46 @@ cmd_launch() {
     ensure_dns
 
     if container_running "$name"; then
-        info "Container already running"
+        info "Sandbox '${name}' is already running"
+        echo ""
+        printf "${YELLOW}%s${NC}\n" "  1) Reuse existing sandbox"
+        printf "${YELLOW}%s${NC}\n" "  2) Destroy and recreate"
+        printf "${YELLOW}%s${NC} " "  Choose [1]: "
+        read -r choice
+        case "${choice:-1}" in
+            2)
+                info "Destroying existing sandbox..."
+                container stop "$name" 2>/dev/null || true
+                container rm "$name" 2>/dev/null || true
+                ;& # fall through to create
+            1|*)
+                ;; # reuse — skip to post-creation setup
+        esac
     elif container_exists "$name"; then
-        info "Starting stopped container..."
-        container start "$name" || die "Failed to start container"
-        wait_container_ssh "$name" || true
-        # Restore bind-mount overlays from previous session
-        if [[ "$mirror" == true ]]; then
-            restore_shadow_deps "$name" "$guest_project"
-        fi
-    else
+        info "Sandbox '${name}' exists but is stopped"
+        echo ""
+        printf "${YELLOW}%s${NC}\n" "  1) Resume existing sandbox"
+        printf "${YELLOW}%s${NC}\n" "  2) Destroy and recreate"
+        printf "${YELLOW}%s${NC} " "  Choose [1]: "
+        read -r choice
+        case "${choice:-1}" in
+            2)
+                info "Destroying existing sandbox..."
+                container rm "$name" 2>/dev/null || true
+                ;; # container no longer exists; will be recreated below
+            1|*)
+                info "Starting stopped container..."
+                container start "$name" || die "Failed to start container"
+                wait_container_ssh "$name" || true
+                # Restore bind-mount overlays from previous session
+                if [[ "$mirror" == true ]]; then
+                    restore_shadow_deps "$name" "$guest_project"
+                fi
+                ;;
+        esac
+    fi
+
+    if ! container_running "$name"; then
         # ── Create new container ─────────────────────────────────────────
         info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
 
@@ -1033,6 +1063,10 @@ cmd_launch() {
         info "Headless mode — use 'srl-sandbox ssh $name' to connect"
         return
     fi
+
+    # ── Lifecycle: stop sandbox when CLI exits ───────────────────────────
+    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; exit 0" EXIT HUP TERM
+    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; exit 0" INT
 
     # ── Interactive launch ───────────────────────────────────────────────
     echo ""
@@ -1107,8 +1141,6 @@ _foreground_wait() {
 
     # Suppress character echo so keypresses don't print to terminal
     stty -echo 2>/dev/null
-    # Ensure terminal is restored on Ctrl+C
-    trap "stty echo 2>/dev/null; _foreground_stop '$name'" INT
 
     # Read single keypress in a loop
     while container_running "$name"; do
@@ -1143,16 +1175,13 @@ _foreground_wait() {
                 stty -echo 2>/dev/null
                 ;;
             q)
-                stty echo 2>/dev/null
-                _foreground_stop "$name"
+                exit 0
                 ;;
         esac
     done
 
-    # Container stopped on its own
-    stty echo 2>/dev/null
-    echo ""
-    info "Sandbox '$name' has stopped."
+    # Container stopped on its own — EXIT trap handles cleanup
+    exit 0
 }
 
 _foreground_stop() {
