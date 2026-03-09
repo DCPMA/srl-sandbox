@@ -1099,14 +1099,10 @@ _foreground_wait() {
     echo ""
     msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
 
-    # Override the global trap to stop this specific container
-    trap "_foreground_stop '$name'" INT
-
     # Suppress character echo so keypresses don't print to terminal
     stty -echo 2>/dev/null
-    # Ensure terminal is restored on exit
+    # Ensure terminal is restored on Ctrl+C
     trap "stty echo 2>/dev/null; _foreground_stop '$name'" INT
-    trap "stty echo 2>/dev/null" RETURN
 
     # Read single keypress in a loop
     while container_running "$name"; do
