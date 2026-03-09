@@ -1568,7 +1568,7 @@ cmd_resize() {
     save_sandbox_state "$name" "$proj_path" "$cpus" "$mem" \
         "${extra_mounts:-}" "$guest_project"
 
-    # Fix 3: Update SSH config after recreating (new IP may have been assigned)
+    # Update SSH config after recreating (new IP may have been assigned)
     info "Waiting for SSH..."
     wait_container_ssh "$name" || warn "SSH not ready yet — run 'srl-sandbox sync' if connection fails"
     inject_ssh_key "$name" 2>/dev/null || true
@@ -1577,6 +1577,9 @@ cmd_resize() {
     if [[ -n "$resize_ip" ]]; then
         update_ssh_config "$name" "$resize_ip" 2>/dev/null || true
     fi
+
+    # Restore git config, GitHub auth, and Claude/AWS symlinks inside the recreated container
+    cmd_sync_internal "$name" "$proj_path" "$guest_project"
 
     success "Sandbox '${name}' resized to ${cpus} vCPU · ${mem} GiB RAM"
 }

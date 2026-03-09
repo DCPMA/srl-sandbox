@@ -233,7 +233,28 @@ _assert_call() {
     assert_output --partial "Specify at least"
 }
 
-# ── Test 11: missing state file exits with helpful error ─────────────────────
+# ── Test 11: cmd_sync_internal called after container recreation ──────────────
+@test "resize calls cmd_sync_internal after recreating container" {
+    write_state "mybox" 2 4 "/proj/myapp" "/home/dev/myapp"
+
+    export MOCK_RUNNING_CONTAINERS="mybox"
+    export MOCK_STOPPED_CONTAINERS=""
+
+    local sync_log="${TEST_TMPDIR}/sync_calls.log"
+
+    _run_zsh "
+        confirm_default_yes() { return 0; }
+        wait_container_ssh() { return 0; }
+        cmd_sync_internal() { echo \"synced:\${1}\" >> '${sync_log}'; }
+        cmd_resize mybox --mem 8
+    "
+
+    assert_success
+    run grep -c 'synced:mybox' "${sync_log}"
+    assert_output "1"
+}
+
+# ── Test 12: missing state file exits with helpful error ─────────────────────
 @test "resize exits with error when state file is missing" {
     # container_exists check needs the container to be visible, but no state file written
     export MOCK_RUNNING_CONTAINERS="mybox"
