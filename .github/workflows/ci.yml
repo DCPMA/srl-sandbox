@@ -44,3 +44,18 @@ jobs:
           ./srl-sandbox help | grep -q "launch"
           ./srl-sandbox help | grep -q "destroy"
           ./srl-sandbox help | grep -q "reset"
+          ./srl-sandbox help | grep -q "resize"
+
+  test:
+    name: BATS Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install zsh
+        run: sudo apt-get install -y zsh
+
+      - name: Run BATS tests
+        run: ./tests/libs/bats/bin/bats tests/

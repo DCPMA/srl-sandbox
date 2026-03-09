@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Mock for Apple 'container' CLI
+# Logs all calls to CONTAINER_CALLS_LOG and simulates basic behavior.
+
+LOG="${CONTAINER_CALLS_LOG:-/tmp/container_calls.log}"
+
+# Log this invocation
+echo "container $*" >> "$LOG"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    ls)
+        # Support: container ls [-a] [--format json]
+        # Return running containers from MOCK_RUNNING_CONTAINERS env var (space-separated)
+        if [[ "$*" == *"-a"* ]]; then
+            # Include stopped containers too
+            for c in ${MOCK_RUNNING_CONTAINERS:-} ${MOCK_STOPPED_CONTAINERS:-}; do
+                echo "$c"
+            done
+        else
+            # Only running
+            for c in ${MOCK_RUNNING_CONTAINERS:-}; do
+                echo "$c"
+            done
+        fi
+        ;;
+    stop)
+        # Succeed silently; mark container as stopped
+        exit 0
+        ;;
+    rm|delete)
+        exit 0
+        ;;
+    run)
+        exit 0
+        ;;
+    start)
+        exit 0
+        ;;
+    exec)
+        exit 0
+        ;;
+    image)
+        # container image ls — return something so check_image finds the image
+        echo "srl-sandbox:latest"
+        ;;
+    system)
+        # container system dns list — pretend DNS domain exists
+        echo "test"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
