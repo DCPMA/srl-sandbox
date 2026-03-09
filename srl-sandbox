@@ -1040,7 +1040,7 @@ cmd_launch() {
         tui_multiselect selected \
             "VS Code Remote SSH|Connect host VS Code via SSH|on" \
             "Claude Code|Launch Claude Code in terminal|off" \
-            "Skip Permissions|--dangerously-skip-permissions|off" \
+            "Skip Permissions|--dangerously-skip-permissions|on" \
             "Code Server|Browser VS Code (installed on demand)|off" \
             "Shell Only|Drop into zsh shell|off"
 
