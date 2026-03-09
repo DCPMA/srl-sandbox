@@ -12,7 +12,7 @@ permissions:
 jobs:
   lint:
     name: Lint & Validate
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -31,11 +31,12 @@ jobs:
             fi
           fi
 
+      - name: Install tools
+        run: sudo apt-get install -y zsh shellcheck
+
       - name: Shellcheck (advisory)
         continue-on-error: true
-        run: |
-          brew install shellcheck 2>/dev/null || true
-          shellcheck -s bash -S warning srl-sandbox || true
+        run: shellcheck -s bash -S warning srl-sandbox || true
 
       - name: Verify help and version
         run: |
@@ -43,5 +44,3 @@ jobs:
           ./srl-sandbox help | grep -q "launch"
           ./srl-sandbox help | grep -q "destroy"
           ./srl-sandbox help | grep -q "reset"
-
-
