@@ -2,8 +2,6 @@
 # Tests for context-aware tab completion in completions/_srl-sandbox
 
 setup() {
-    load 'libs/bats-support/load'
-    load 'libs/bats-assert/load'
     load 'helpers/common'
     setup_mocks
 }

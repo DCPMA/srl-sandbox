@@ -1,20 +1,71 @@
 #!/usr/bin/env bash
-# Mock container CLI for testing
-# Reads MOCK_RUNNING_CONTAINERS and MOCK_STOPPED_CONTAINERS env vars (space-separated)
+# Mock for Apple 'container' CLI
+# Logs all calls to CONTAINER_CALLS_LOG and simulates basic behavior.
 
-CALL_LOG="${TMPDIR:-/tmp}/container_calls.log"
-echo "container $*" >> "$CALL_LOG"
+LOG="${CONTAINER_CALLS_LOG:-/tmp/container_calls.log}"
 
-if [[ "$1" == "list" ]]; then
-    printf "NAME\tSTATUS\tIMAGE\n"
-    for name in ${MOCK_RUNNING_CONTAINERS:-}; do
-        [[ -z "$name" ]] && continue
-        printf "%s\trunning\tmock-image\n" "$name"
-    done
-    if [[ "$2" == "-a" || "$2" == "--all" ]]; then
-        for name in ${MOCK_STOPPED_CONTAINERS:-}; do
-            [[ -z "$name" ]] && continue
-            printf "%s\tstopped\tmock-image\n" "$name"
-        done
-    fi
-fi
+# Log this invocation
+echo "container $*" >> "$LOG"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    list)
+        # container list — 9-column tabular output matching real CLI format
+        # Used by completion functions: awk 'NR>1 && $5=="running" {print $1}'
+        printf "ID\tIMAGE\tOS\tARCH\tSTATE\tADDR\tCPUS\tMEMORY\tSTARTED\n"
+        if [[ "$*" == *"-a"* || "$*" == *"--all"* ]]; then
+            # Include both running and stopped
+            for c in ${MOCK_RUNNING_CONTAINERS:-}; do
+                printf "%s\tmock-image\tlinux\tarm64\trunning\t192.168.64.2\t4\t4G\t2024-01-01\n" "$c"
+            done
+            for c in ${MOCK_STOPPED_CONTAINERS:-}; do
+                printf "%s\tmock-image\tlinux\tarm64\tstopped\t-\t-\t-\t-\n" "$c"
+            done
+        else
+            # Only running
+            for c in ${MOCK_RUNNING_CONTAINERS:-}; do
+                printf "%s\tmock-image\tlinux\tarm64\trunning\t192.168.64.2\t4\t4G\t2024-01-01\n" "$c"
+            done
+        fi
+        ;;
+    ls)
+        # container ls — used by container_running() via grep -qw
+        if [[ "$*" == *"-a"* ]]; then
+            for c in ${MOCK_RUNNING_CONTAINERS:-} ${MOCK_STOPPED_CONTAINERS:-}; do
+                echo "$c"
+            done
+        else
+            for c in ${MOCK_RUNNING_CONTAINERS:-}; do
+                echo "$c"
+            done
+        fi
+        ;;
+    stop)
+        exit 0
+        ;;
+    rm|delete)
+        exit 0
+        ;;
+    run)
+        exit 0
+        ;;
+    start)
+        exit 0
+        ;;
+    exec)
+        exit 0
+        ;;
+    image)
+        # container image ls — return something so check_image finds the image
+        echo "srl-sandbox:latest"
+        ;;
+    system)
+        # container system dns list — pretend DNS domain exists
+        echo "test"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
