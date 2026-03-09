@@ -493,8 +493,9 @@ cmd_sync_internal() {
     # ── Claude & AWS config symlinks ─────────────────────────────────────
     container exec "$name" bash -c \
         "ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
+         ln -sfn /mnt/claude.json /home/${DEFAULT_USER}/.claude.json 2>/dev/null; \
          ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
-         chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.aws 2>/dev/null" \
+         chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.claude.json /home/${DEFAULT_USER}/.aws 2>/dev/null" \
         2>/dev/null || warn "Config symlinks may have failed"
 
     # ── Git config sync ──────────────────────────────────────────────────
@@ -970,6 +971,7 @@ cmd_launch() {
         info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
 
         mkdir -p "$HOME/.claude" "$HOME/.aws"
+        touch "$HOME/.claude.json"  # ensure file exists for volume mount
 
         local -a run_args=(
             run -d
@@ -978,6 +980,7 @@ cmd_launch() {
             --memory "${mem}G"
             --volume "${proj_path}:${guest_project}"
             --volume "$HOME/.claude:/mnt/claude"
+            --volume "$HOME/.claude.json:/mnt/claude.json"
             --volume "$HOME/.aws:/mnt/aws"
         )
 
@@ -1360,6 +1363,7 @@ cmd_info() {
     printf "  ${BOLD}Mounts${NC}\n"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "$guest_project"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/mnt/claude → ~/.claude"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "claude.json" "~/.claude.json" "/mnt/claude.json → ~/.claude.json"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/mnt/aws → ~/.aws"
     if [[ -n "$extra_mounts" && "$extra_mounts" != "-" ]]; then
         IFS=',' read -rA mount_arr <<< "$extra_mounts"
