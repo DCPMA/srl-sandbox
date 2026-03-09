@@ -1040,7 +1040,7 @@ cmd_launch() {
         tui_multiselect selected \
             "VS Code Remote SSH|Connect host VS Code via SSH|on" \
             "Claude Code|Launch Claude Code in terminal|off" \
-            "Skip Permissions|--dangerously-skip-permissions|on" \
+            "Skip Permissions|--dangerously-skip-permissions|off" \
             "Code Server|Browser VS Code (installed on demand)|off" \
             "Shell Only|Drop into zsh shell|off"
 
@@ -1177,6 +1177,11 @@ _launch_claude() {
     if container exec "$name" su - "${DEFAULT_USER}" -c \
         "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
         local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd '${guest_project}' && claude"
+        if [[ "$skip_perms" != "true" ]]; then
+            if confirm_default_yes "Launch Claude with --dangerously-skip-permissions?"; then
+                skip_perms=true
+            fi
+        fi
         if [[ "$skip_perms" == "true" ]]; then
             claude_cmd+=" --dangerously-skip-permissions"
             info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
