@@ -490,12 +490,13 @@ cmd_sync_internal() {
             2>/dev/null || warn "Project path symlink may have failed"
     fi
 
-    # ── Claude & AWS config symlinks ─────────────────────────────────────
+    # ── Claude & AWS config symlinks (only if mounts exist) ─────────────
     container exec "$name" bash -c \
-        "ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
-         ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
-         chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.aws 2>/dev/null" \
-        2>/dev/null || warn "Config symlinks may have failed"
+        "[ -e /mnt/claude ] && ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
+         [ -e /mnt/claude.json ] && ln -sfn /mnt/claude.json /home/${DEFAULT_USER}/.claude.json 2>/dev/null; \
+         [ -e /mnt/aws ] && ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
+         chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.claude.json /home/${DEFAULT_USER}/.aws 2>/dev/null" \
+        2>/dev/null || true
 
     # ── Git config sync ──────────────────────────────────────────────────
     info "Syncing Git configuration..."
@@ -914,6 +915,7 @@ cmd_launch() {
     local cpus=$DEFAULT_CPUS
     local mem=$DEFAULT_MEM
     local no_sync=false
+    local no_config=false
     local mirror=false
     local headless=false
     local -a extra_mounts=()
@@ -925,6 +927,7 @@ cmd_launch() {
             --mem)       mem="$2"; shift 2 ;;
             --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
+            --no-config) no_config=true; shift ;;
             --mirror)    mirror=true; shift ;;
             --headless|--detach|-d) headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
@@ -956,20 +959,48 @@ cmd_launch() {
     ensure_dns
 
     if container_running "$name"; then
-        info "Container already running"
+        info "Sandbox '${name}' is already running"
+        echo ""
+        printf "${YELLOW}%s${NC}\n" "  1) Reuse existing sandbox"
+        printf "${YELLOW}%s${NC}\n" "  2) Destroy and recreate"
+        printf "${YELLOW}%s${NC} " "  Choose [1]: "
+        read -r choice
+        case "${choice:-1}" in
+            2)
+                info "Destroying existing sandbox..."
+                container stop "$name" 2>/dev/null || true
+                container rm "$name" 2>/dev/null || true
+                ;; # container destroyed; will be recreated below
+            1|*)
+                ;; # reuse — skip to post-creation setup
+        esac
     elif container_exists "$name"; then
-        info "Starting stopped container..."
-        container start "$name" || die "Failed to start container"
-        wait_container_ssh "$name" || true
-        # Restore bind-mount overlays from previous session
-        if [[ "$mirror" == true ]]; then
-            restore_shadow_deps "$name" "$guest_project"
-        fi
-    else
+        info "Sandbox '${name}' exists but is stopped"
+        echo ""
+        printf "${YELLOW}%s${NC}\n" "  1) Resume existing sandbox"
+        printf "${YELLOW}%s${NC}\n" "  2) Destroy and recreate"
+        printf "${YELLOW}%s${NC} " "  Choose [1]: "
+        read -r choice
+        case "${choice:-1}" in
+            2)
+                info "Destroying existing sandbox..."
+                container rm "$name" 2>/dev/null || true
+                ;; # container no longer exists; will be recreated below
+            1|*)
+                info "Starting stopped container..."
+                container start "$name" || die "Failed to start container"
+                wait_container_ssh "$name" || true
+                # Restore bind-mount overlays from previous session
+                if [[ "$mirror" == true ]]; then
+                    restore_shadow_deps "$name" "$guest_project"
+                fi
+                ;;
+        esac
+    fi
+
+    if ! container_running "$name"; then
         # ── Create new container ─────────────────────────────────────────
         info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
-
-        mkdir -p "$HOME/.claude" "$HOME/.aws"
 
         local -a run_args=(
             run -d
@@ -977,9 +1008,17 @@ cmd_launch() {
             --cpus "$cpus"
             --memory "${mem}G"
             --volume "${proj_path}:${guest_project}"
-            --volume "$HOME/.claude:/mnt/claude"
-            --volume "$HOME/.aws:/mnt/aws"
         )
+
+        if [[ "$no_config" != true ]]; then
+            mkdir -p "$HOME/.claude" "$HOME/.aws"
+            touch "$HOME/.claude.json"  # ensure file exists for volume mount
+            run_args+=(
+                --volume "$HOME/.claude:/mnt/claude"
+                --volume "$HOME/.claude.json:/mnt/claude.json"
+                --volume "$HOME/.aws:/mnt/aws"
+            )
+        fi
 
         for mount_spec in "${extra_mounts[@]}"; do
             run_args+=(--volume "$mount_spec")
@@ -1024,6 +1063,9 @@ cmd_launch() {
         info "Headless mode — use 'srl-sandbox ssh $name' to connect"
         return
     fi
+
+    # ── Lifecycle: stop sandbox when CLI exits ───────────────────────────
+    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; trap - EXIT HUP TERM INT" EXIT HUP TERM INT
 
     # ── Interactive launch ───────────────────────────────────────────────
     echo ""
@@ -1096,14 +1138,8 @@ _foreground_wait() {
     echo ""
     msg "${DIM}  ${BOLD}v${NC}${DIM} = VS Code  ${BOLD}s${NC}${DIM} = SSH  ${BOLD}e${NC}${DIM} = Sync Extensions  ${BOLD}q${NC}${DIM}/Ctrl+C = Stop${NC}"
 
-    # Override the global trap to stop this specific container
-    trap "_foreground_stop '$name'" INT
-
     # Suppress character echo so keypresses don't print to terminal
     stty -echo 2>/dev/null
-    # Ensure terminal is restored on exit
-    trap "stty echo 2>/dev/null; _foreground_stop '$name'" INT
-    trap "stty echo 2>/dev/null" RETURN
 
     # Read single keypress in a loop
     while container_running "$name"; do
@@ -1138,24 +1174,12 @@ _foreground_wait() {
                 stty -echo 2>/dev/null
                 ;;
             q)
-                stty echo 2>/dev/null
-                _foreground_stop "$name"
+                exit 0
                 ;;
         esac
     done
 
-    # Container stopped on its own
-    stty echo 2>/dev/null
-    echo ""
-    info "Sandbox '$name' has stopped."
-}
-
-_foreground_stop() {
-    local name="$1"
-    echo ""
-    info "Stopping sandbox '$name'..."
-    container stop "$name" 2>/dev/null || true
-    msg "Sandbox '$name' stopped."
+    # Container stopped on its own — EXIT trap handles cleanup
     exit 0
 }
 
@@ -1178,6 +1202,11 @@ _launch_claude() {
     if container exec "$name" su - "${DEFAULT_USER}" -c \
         "source ~/.nvm/nvm.sh 2>/dev/null; command -v claude" &>/dev/null; then
         local claude_cmd="source ~/.nvm/nvm.sh 2>/dev/null; cd '${guest_project}' && claude"
+        if [[ "$skip_perms" != "true" ]]; then
+            if confirm_default_yes "Launch Claude with --dangerously-skip-permissions?"; then
+                skip_perms=true
+            fi
+        fi
         if [[ "$skip_perms" == "true" ]]; then
             claude_cmd+=" --dangerously-skip-permissions"
             info "Launching Claude Code ${DIM}(--dangerously-skip-permissions)${NC}..."
@@ -1360,6 +1389,7 @@ cmd_info() {
     printf "  ${BOLD}Mounts${NC}\n"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "project" "$proj_path" "$guest_project"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "claude" "~/.claude" "/mnt/claude → ~/.claude"
+    printf "  ${DIM}%-12s %s → %s${NC}\n" "claude.json" "~/.claude.json" "/mnt/claude.json → ~/.claude.json"
     printf "  ${DIM}%-12s %s → %s${NC}\n" "aws" "~/.aws" "/mnt/aws → ~/.aws"
     if [[ -n "$extra_mounts" && "$extra_mounts" != "-" ]]; then
         IFS=',' read -rA mount_arr <<< "$extra_mounts"
@@ -1459,6 +1489,7 @@ cmd_help() {
     printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
     printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
+    printf "    ${CYAN}--no-config${NC}              Don't mount host ~/.claude, ~/.claude.json, ~/.aws\n"
     printf "    ${CYAN}--mirror${NC}                 Auto-detect and install platform-native dependencies\n"
     printf "    ${CYAN}--headless${NC} / ${CYAN}-d${NC}          Detach: don't open editor or wait in foreground\n"
     echo ""
