@@ -65,11 +65,10 @@ jobs:
           git commit -m "chore: bump version to ${NEW}"
           git push origin "$branch"
 
+          body=$(printf 'Bumps VERSION from %s to %s.\n\nMerging this PR will automatically create the `v%s` tag, publish the GitHub Release, and update the Homebrew formula.' "$CURRENT" "$NEW" "$NEW")
           gh pr create \
             --title "Release v${NEW}" \
-            --body "Bumps VERSION from ${CURRENT} to ${NEW}.
-
-Merging this PR will automatically create the \`v${NEW}\` tag, publish the GitHub Release, and update the Homebrew formula." \
+            --body "$body" \
             --base main \
             --head "$branch" \
             --label "release"
