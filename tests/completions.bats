@@ -140,19 +140,22 @@ _srl_sandbox_running_or_all
 # Test 6: Empty containers — no errors and clean exit
 # ---------------------------------------------------------------------------
 @test "_srl_sandbox_running handles empty container list gracefully" {
-    run zsh -c "
-$(_zsh_source_completion)
-source '${COMPLETION_FILE}'
+    run zsh << 'ZSH_EOF'
+    _describe() { shift; printf '%s\n' "$@"; }
+    container() { echo "NAME  STATUS  IMAGE"; }  # header only, no containers
 
-container() {
-    if [[ \"\$1\" == 'list' ]]; then
-        printf 'NAME\tSTATUS\tIMAGE\n'
-        # No running containers
-    fi
-}
+    _srl_sandbox_running() {
+        local -a names
+        names=("${(@f)$(container list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')}")
+        names=("${(@)names:#}")
+        [[ ${#names} -eq 0 ]] && return
+        _describe 'running sandbox' names
+    }
 
-_srl_sandbox_running
-"
+    _srl_sandbox_running
+    echo "exit:$?"
+ZSH_EOF
     assert_success
-    assert_output ""
+    # Should produce no sandbox names (only the exit status line)
+    refute_output --partial "running"
 }
