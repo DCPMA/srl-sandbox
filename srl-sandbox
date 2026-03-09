@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-readonly VERSION="2.3.0"
+readonly VERSION="2.4.0"
 readonly IMAGE_NAME="srl-sandbox"
 readonly IMAGE_TAG="latest"
 readonly IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
