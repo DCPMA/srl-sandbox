@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Mock container CLI for testing
+# Reads MOCK_RUNNING_CONTAINERS and MOCK_STOPPED_CONTAINERS env vars (space-separated)
+
+CALL_LOG="${TMPDIR:-/tmp}/container_calls.log"
+echo "container $*" >> "$CALL_LOG"
+
+if [[ "$1" == "list" ]]; then
+    printf "NAME\tSTATUS\tIMAGE\n"
+    for name in ${MOCK_RUNNING_CONTAINERS:-}; do
+        [[ -z "$name" ]] && continue
+        printf "%s\trunning\tmock-image\n" "$name"
+    done
+    if [[ "$2" == "-a" || "$2" == "--all" ]]; then
+        for name in ${MOCK_STOPPED_CONTAINERS:-}; do
+            [[ -z "$name" ]] && continue
+            printf "%s\tstopped\tmock-image\n" "$name"
+        done
+    fi
+fi
