@@ -104,7 +104,7 @@ To skip this: `srl-sandbox --no-deps`
 | Ecosystem | Detected By | Shadow Directory |
 |-----------|-------------|-----------------|
 | Node.js   | `package.json` | `node_modules/` |
-| Python    | `requirements.txt`, `pyproject.toml`, `Pipfile`, `setup.py` | `.venv/` or `venv/` |
+| Python    | `requirements.txt`, `pyproject.toml`, `Pipfile`, `setup.py`, `setup.cfg` | `.venv/` or `venv/` |
 
 ## License
 

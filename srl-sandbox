@@ -580,17 +580,18 @@ setup_node_shadow() {
     info "Setting up Node.js dependencies (Linux)..."
 
     container exec "$name" bash -c "
+        set -e
         mkdir -p '${shadow_nm}'
         chown ${DEFAULT_USER}:${DEFAULT_USER} '${shadow_nm}'
         mkdir -p '${guest_project}/node_modules'
         mount --bind '${shadow_nm}' '${guest_project}/node_modules'
-    " 2>/dev/null || { warn "Node.js shadow overlay failed"; return 1; }
+    " || { warn "Node.js shadow overlay failed"; return 1; }
 
     container exec "$name" su - "${DEFAULT_USER}" -c "
         export NVM_DIR=\"\$HOME/.nvm\"
         [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
-        cd '${guest_project}' && npm install 2>&1 | tail -1
-    " 2>/dev/null && msg "Node.js dependencies installed" \
+        cd '${guest_project}' && npm install 2>&1 | tail -5
+    " && msg "Node.js dependencies installed" \
         || warn "npm install failed — run manually inside sandbox"
 }
 
@@ -612,11 +613,12 @@ setup_python_shadow() {
     info "Setting up Python environment (Linux)..."
 
     container exec "$name" bash -c "
+        set -e
         mkdir -p '${shadow_venv}'
         chown ${DEFAULT_USER}:${DEFAULT_USER} '${shadow_venv}'
         mkdir -p '${target_venv}'
         mount --bind '${shadow_venv}' '${target_venv}'
-    " 2>/dev/null || { warn "Python shadow overlay failed"; return 1; }
+    " || { warn "Python shadow overlay failed"; return 1; }
 
     container exec "$name" su - "${DEFAULT_USER}" -c "
         cd '${guest_project}'
@@ -626,11 +628,14 @@ setup_python_shadow() {
         if [ -f requirements.txt ]; then
             pip install -r requirements.txt -q
         elif [ -f pyproject.toml ]; then
-            pip install -e '.[dev]' -q 2>/dev/null || pip install -e . -q
+            if ! pip install -e '.[dev]' -q 2>&1; then
+                echo 'dev extras failed, installing base only' >&2
+                pip install -e . -q
+            fi
         elif [ -f Pipfile ]; then
             pip install pipenv -q && pipenv install --dev
         fi
-    " 2>/dev/null && msg "Python environment ready" \
+    " && msg "Python environment ready" \
         || warn "Python setup incomplete — run manually inside sandbox"
 }
 
@@ -664,12 +669,13 @@ setup_shadow_deps() {
     msg "Detected: ${BOLD}${ecosystems}${NC}"
 
     container exec "$name" su - "${DEFAULT_USER}" -c \
-        "mkdir -p '${shadow_dir}'" 2>/dev/null
+        "mkdir -p '${shadow_dir}'" \
+        || { warn "Failed to create shadow directory '${shadow_dir}'"; return 0; }
 
     for eco in ${=ecosystems}; do
         case "$eco" in
-            node)   setup_node_shadow "$name" "$guest_project" "$shadow_dir" ;;
-            python) setup_python_shadow "$name" "$guest_project" "$shadow_dir" ;;
+            node)   setup_node_shadow "$name" "$guest_project" "$shadow_dir" || true ;;
+            python) setup_python_shadow "$name" "$guest_project" "$shadow_dir" || true ;;
         esac
     done
 
@@ -687,18 +693,22 @@ restore_shadow_deps() {
 
     if container exec "$name" test -d "${shadow_dir}/node_modules" 2>/dev/null; then
         container exec "$name" bash -c "
+            set -e
             mkdir -p '${guest_project}/node_modules'
+            chown ${DEFAULT_USER}:${DEFAULT_USER} '${guest_project}/node_modules'
             mount --bind '${shadow_dir}/node_modules' '${guest_project}/node_modules'
-        " 2>/dev/null && msg "Node.js overlay restored" \
+        " && msg "Node.js overlay restored" \
             || warn "Node.js overlay restore failed"
     fi
 
     for candidate in .venv venv; do
         if container exec "$name" test -d "${shadow_dir}/${candidate}" 2>/dev/null; then
             container exec "$name" bash -c "
+                set -e
                 mkdir -p '${guest_project}/${candidate}'
+                chown ${DEFAULT_USER}:${DEFAULT_USER} '${guest_project}/${candidate}'
                 mount --bind '${shadow_dir}/${candidate}' '${guest_project}/${candidate}'
-            " 2>/dev/null && msg "Python overlay restored" \
+            " && msg "Python overlay restored" \
                 || warn "Python overlay restore failed"
             break
         fi
