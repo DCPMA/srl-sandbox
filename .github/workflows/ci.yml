@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install tools
+        run: sudo apt-get install -y zsh shellcheck
+
       - name: Shell syntax check
         run: zsh -n srl-sandbox
 
@@ -30,9 +33,6 @@ jobs:
               echo "::warning::Version mismatch: script=$script_ver formula=$formula_ver (formula updated on release)"
             fi
           fi
-
-      - name: Install tools
-        run: sudo apt-get install -y zsh shellcheck
 
       - name: Shellcheck (advisory)
         continue-on-error: true
