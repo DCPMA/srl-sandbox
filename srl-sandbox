@@ -1461,6 +1461,129 @@ cmd_reset() {
     success "Reset complete. Run 'srl-sandbox build' to rebuild the image."
 }
 
+cmd_resize() {
+    [[ $# -lt 1 ]] && die "Usage: srl-sandbox resize <name> [--mem <GiB>] [--cpus <n>]"
+    local name="$1"; shift
+
+    local mem=""
+    local cpus=""
+    local explicit_mem=""
+    local explicit_cpus=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mem)   mem="$2"; explicit_mem=1;  shift 2 ;;
+            --cpus)  cpus="$2"; explicit_cpus=1; shift 2 ;;
+            -*)      die "Unknown option: $1" ;;
+            *)       die "Unknown argument: $1" ;;
+        esac
+    done
+
+    # Fix 4: Reject no-op resize (neither flag provided)
+    [[ -z "$explicit_mem" && -z "$explicit_cpus" ]] && die "Specify at least --mem <GiB> or --cpus <n> to resize"
+
+    # Validate name and existence
+    validate_name "$name"
+    container_exists "$name" || die "Sandbox '$name' not found"
+
+    # Validate numeric values when provided
+    if [[ -n "$mem" ]]; then
+        [[ "$mem" =~ ^[0-9]+$ ]] || die "Invalid --mem value: '${mem}' (must be a positive integer)"
+        (( mem > 0 )) || die "Invalid --mem value: ${mem} (must be greater than 0)"
+    fi
+    if [[ -n "$cpus" ]]; then
+        [[ "$cpus" =~ ^[0-9]+$ ]] || die "Invalid --cpus value: '${cpus}' (must be a positive integer)"
+        (( cpus > 0 )) || die "Invalid --cpus value: ${cpus} (must be greater than 0)"
+    fi
+
+    # Load current state
+    local state_file
+    state_file=$(sandbox_state_file "$name")
+
+    # Fix 2: Guard against missing state file
+    [[ -f "$state_file" ]] || die "State file for sandbox '$name' not found. Try 'srl-sandbox launch' first."
+
+    local proj_path guest_project extra_mounts current_cpus current_mem
+    proj_path=$(json_get "$state_file" "project_path")
+    guest_project=$(json_get "$state_file" "guest_project")
+    extra_mounts=$(json_get "$state_file" "extra_mounts")
+    current_cpus=$(json_get "$state_file" "cpus")
+    current_mem=$(json_get "$state_file" "mem")
+
+    # Use current values as defaults when flag not supplied
+    [[ -z "$mem" ]]  && mem="$current_mem"
+    [[ -z "$cpus" ]] && cpus="$current_cpus"
+    [[ -z "$guest_project" || "$guest_project" == "null" ]] && \
+        guest_project="/home/${DEFAULT_USER}/$(basename "$proj_path")"
+
+    # Confirm with user
+    confirm_default_yes "This will briefly stop sandbox '${name}' to apply new settings. Continue?" \
+        || { info "Cancelled."; return 0; }
+
+    # Stop if running
+    if container_running "$name"; then
+        info "Stopping sandbox '${name}'..."
+        container stop "$name" || die "Failed to stop container"
+    fi
+
+    # Remove existing container
+    info "Removing container '${name}'..."
+    container rm "$name" 2>/dev/null || container delete "$name" 2>/dev/null \
+        || die "Failed to remove container"
+
+    # Build run args
+    local -a run_args=(
+        run -d
+        --name "$name"
+        --cpus "$cpus"
+        --memory "${mem}G"
+        --volume "${proj_path}:${guest_project}"
+    )
+
+    mkdir -p "$HOME/.claude" "$HOME/.aws"
+    touch "$HOME/.claude.json"
+    run_args+=(
+        --volume "$HOME/.claude:/mnt/claude"
+        --volume "$HOME/.claude.json:/mnt/claude.json"
+        --volume "$HOME/.aws:/mnt/aws"
+    )
+
+    # Fix 1: Re-add extra mounts using zsh array split on commas
+    if [[ -n "$extra_mounts" && "$extra_mounts" != "null" ]]; then
+        local -a mount_arr
+        IFS=',' read -rA mount_arr <<< "$extra_mounts"
+        local mount_spec
+        for mount_spec in "${mount_arr[@]}"; do
+            [[ -n "$mount_spec" ]] || continue
+            run_args+=(--volume "$mount_spec")
+        done
+    fi
+
+    run_args+=("$IMAGE_REF")
+
+    info "Recreating sandbox '${name}' with ${cpus} CPUs, ${mem} GiB RAM..."
+    container "${run_args[@]}" || die "Failed to recreate container"
+
+    # Save updated state
+    save_sandbox_state "$name" "$proj_path" "$cpus" "$mem" \
+        "${extra_mounts:-}" "$guest_project"
+
+    # Update SSH config after recreating (new IP may have been assigned)
+    info "Waiting for SSH..."
+    wait_container_ssh "$name" || warn "SSH not ready yet — run 'srl-sandbox sync' if connection fails"
+    inject_ssh_key "$name" 2>/dev/null || true
+    local resize_ip
+    resize_ip=$(container_ip "$name")
+    if [[ -n "$resize_ip" ]]; then
+        update_ssh_config "$name" "$resize_ip" 2>/dev/null || true
+    fi
+
+    # Restore git config, GitHub auth, and Claude/AWS symlinks inside the recreated container
+    cmd_sync_internal "$name" "$proj_path" "$guest_project"
+
+    success "Sandbox '${name}' resized to ${cpus} vCPU · ${mem} GiB RAM"
+}
+
 cmd_help() {
     echo ""
     printf "  ${BOLD}${CYAN}srl-sandbox${NC} ${DIM}v${VERSION}${NC}\n"
@@ -1480,6 +1603,8 @@ cmd_help() {
     printf "    ${CYAN}sync-extensions${NC} ${DIM}<name>${NC}  Sync VS Code extensions & settings to sandbox\n"
     printf "    ${CYAN}info${NC} ${DIM}<name>${NC}             Show sandbox details\n"
     printf "    ${CYAN}build${NC}                    Rebuild container image\n"
+    printf "    ${CYAN}resize${NC} ${DIM}<name> [--mem <GiB>] [--cpus <n>]${NC}\n"
+    printf "           ${DIM}Change memory/CPU (requires brief container restart)${NC}\n"
     printf "    ${CYAN}reset${NC} ${DIM}[--all]${NC}             Remove base image ${DIM}(--all: destroy all sandboxes too)${NC}\n"
     printf "    ${CYAN}help${NC}                     Show this help\n"
     echo ""
@@ -1553,6 +1678,7 @@ main() {
         sync-extensions)   check_container_cli; cmd_sync_extensions "$@" ;;
         info)              check_container_cli; cmd_info "$@" ;;
         build)             check_container_cli; cmd_build "$@" ;;
+        resize)            check_container_cli; cmd_resize "$@" ;;
         reset)             check_container_cli; cmd_reset "$@" ;;
         help|--help|-h)    cmd_help ;;
         version|--version|-v) echo "srl-sandbox v${VERSION}" ;;
@@ -1561,4 +1687,4 @@ main() {
     esac
 }
 
-main "$@"
+[[ -n "${BATS_TEST_SOURCING:-}" ]] || main "$@"
