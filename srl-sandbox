@@ -490,13 +490,13 @@ cmd_sync_internal() {
             2>/dev/null || warn "Project path symlink may have failed"
     fi
 
-    # ── Claude & AWS config symlinks ─────────────────────────────────────
+    # ── Claude & AWS config symlinks (only if mounts exist) ─────────────
     container exec "$name" bash -c \
-        "ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
-         ln -sfn /mnt/claude.json /home/${DEFAULT_USER}/.claude.json 2>/dev/null; \
-         ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
+        "[ -e /mnt/claude ] && ln -sfn /mnt/claude /home/${DEFAULT_USER}/.claude 2>/dev/null; \
+         [ -e /mnt/claude.json ] && ln -sfn /mnt/claude.json /home/${DEFAULT_USER}/.claude.json 2>/dev/null; \
+         [ -e /mnt/aws ] && ln -sfn /mnt/aws /home/${DEFAULT_USER}/.aws 2>/dev/null; \
          chown -h ${DEFAULT_USER}:${DEFAULT_USER} /home/${DEFAULT_USER}/.claude /home/${DEFAULT_USER}/.claude.json /home/${DEFAULT_USER}/.aws 2>/dev/null" \
-        2>/dev/null || warn "Config symlinks may have failed"
+        2>/dev/null || true
 
     # ── Git config sync ──────────────────────────────────────────────────
     info "Syncing Git configuration..."
@@ -915,6 +915,7 @@ cmd_launch() {
     local cpus=$DEFAULT_CPUS
     local mem=$DEFAULT_MEM
     local no_sync=false
+    local no_config=false
     local mirror=false
     local headless=false
     local -a extra_mounts=()
@@ -926,6 +927,7 @@ cmd_launch() {
             --mem)       mem="$2"; shift 2 ;;
             --mount)     extra_mounts+=("$2"); shift 2 ;;
             --no-sync)   no_sync=true; shift ;;
+            --no-config) no_config=true; shift ;;
             --mirror)    mirror=true; shift ;;
             --headless|--detach|-d) headless=true; shift ;;
             -*)          die "Unknown option: $1" ;;
@@ -970,19 +972,23 @@ cmd_launch() {
         # ── Create new container ─────────────────────────────────────────
         info "Creating container: ${cpus} CPUs, ${mem} GiB RAM"
 
-        mkdir -p "$HOME/.claude" "$HOME/.aws"
-        touch "$HOME/.claude.json"  # ensure file exists for volume mount
-
         local -a run_args=(
             run -d
             --name "$name"
             --cpus "$cpus"
             --memory "${mem}G"
             --volume "${proj_path}:${guest_project}"
-            --volume "$HOME/.claude:/mnt/claude"
-            --volume "$HOME/.claude.json:/mnt/claude.json"
-            --volume "$HOME/.aws:/mnt/aws"
         )
+
+        if [[ "$no_config" != true ]]; then
+            mkdir -p "$HOME/.claude" "$HOME/.aws"
+            touch "$HOME/.claude.json"  # ensure file exists for volume mount
+            run_args+=(
+                --volume "$HOME/.claude:/mnt/claude"
+                --volume "$HOME/.claude.json:/mnt/claude.json"
+                --volume "$HOME/.aws:/mnt/aws"
+            )
+        fi
 
         for mount_spec in "${extra_mounts[@]}"; do
             run_args+=(--volume "$mount_spec")
@@ -1464,6 +1470,7 @@ cmd_help() {
     printf "    ${CYAN}--mem${NC} ${DIM}<n>${NC}               RAM in GiB ${DIM}(default: $DEFAULT_MEM)${NC}\n"
     printf "    ${CYAN}--mount${NC} ${DIM}<host>:<guest>${NC}  Mount extra directory ${DIM}(repeatable)${NC}\n"
     printf "    ${CYAN}--no-sync${NC}                Skip settings/credentials sync\n"
+    printf "    ${CYAN}--no-config${NC}              Don't mount host ~/.claude, ~/.claude.json, ~/.aws\n"
     printf "    ${CYAN}--mirror${NC}                 Auto-detect and install platform-native dependencies\n"
     printf "    ${CYAN}--headless${NC} / ${CYAN}-d${NC}          Detach: don't open editor or wait in foreground\n"
     echo ""
