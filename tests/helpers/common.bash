@@ -62,12 +62,14 @@ _run_zsh() {
 }
 
 # Write a minimal state JSON for a sandbox into the fake HOME
+# Args: name [cpus [mem [proj_path [guest_project [extra_mounts]]]]]
 write_state() {
     local name="$1"
     local cpus="${2:-2}"
     local mem="${3:-4}"
     local proj_path="${4:-/home/dev/project}"
     local guest_project="${5:-/home/dev/project}"
+    local extra_mounts="${6:-}"
     local state_file="${HOME}/.config/srl-sandbox/sandboxes/${name}.json"
     python3 - <<PYEOF
 import json
@@ -77,7 +79,7 @@ d = {
     "guest_project": "${guest_project}",
     "cpus": ${cpus},
     "mem": ${mem},
-    "extra_mounts": "",
+    "extra_mounts": "${extra_mounts}",
     "created": "2026-03-09T00:00:00Z"
 }
 json.dump(d, open("${state_file}", "w"), indent=2)

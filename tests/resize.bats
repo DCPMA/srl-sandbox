@@ -194,3 +194,56 @@ _assert_call() {
         return 1
     fi
 }
+
+# ── Test 9: multiple extra mounts are each passed as --volume ────────────────
+@test "resize re-adds multiple comma-separated extra mounts as individual --volume flags" {
+    # Write state with two extra mounts stored as comma-separated string
+    write_state "mybox" 2 4 "/proj/myapp" "/home/dev/myapp" "/host/data:/mnt/data,/host/logs:/mnt/logs"
+
+    export MOCK_RUNNING_CONTAINERS="mybox"
+    export MOCK_STOPPED_CONTAINERS=""
+
+    _run_zsh "
+        confirm_default_yes() { return 0; }
+        cmd_resize mybox --mem 8
+    "
+
+    assert_success
+
+    # Each mount should appear as a separate --volume flag in the container run call
+    grep -qF -- "--volume /host/data:/mnt/data" "${CONTAINER_CALLS_LOG}" \
+        || (echo "Expected --volume /host/data:/mnt/data"; cat "${CONTAINER_CALLS_LOG}"; return 1)
+    grep -qF -- "--volume /host/logs:/mnt/logs" "${CONTAINER_CALLS_LOG}" \
+        || (echo "Expected --volume /host/logs:/mnt/logs"; cat "${CONTAINER_CALLS_LOG}"; return 1)
+}
+
+# ── Test 10: no-op resize (no flags) exits with error ───────────────────────
+@test "resize with no --mem or --cpus flags exits with error" {
+    write_state "mybox" 2 4 "/proj/myapp" "/home/dev/myapp"
+
+    export MOCK_RUNNING_CONTAINERS="mybox"
+    export MOCK_STOPPED_CONTAINERS=""
+
+    _run_zsh "
+        confirm_default_yes() { return 0; }
+        cmd_resize mybox
+    "
+
+    assert_failure
+    assert_output --partial "Specify at least"
+}
+
+# ── Test 11: missing state file exits with helpful error ─────────────────────
+@test "resize exits with error when state file is missing" {
+    # container_exists check needs the container to be visible, but no state file written
+    export MOCK_RUNNING_CONTAINERS="mybox"
+    export MOCK_STOPPED_CONTAINERS=""
+
+    _run_zsh "
+        confirm_default_yes() { return 0; }
+        cmd_resize mybox --mem 8
+    "
+
+    assert_failure
+    assert_output --partial "State file"
+}
