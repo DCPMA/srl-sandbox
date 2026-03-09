@@ -970,7 +970,7 @@ cmd_launch() {
                 info "Destroying existing sandbox..."
                 container stop "$name" 2>/dev/null || true
                 container rm "$name" 2>/dev/null || true
-                ;& # fall through to create
+                ;; # container destroyed; will be recreated below
             1|*)
                 ;; # reuse — skip to post-creation setup
         esac
@@ -1065,8 +1065,7 @@ cmd_launch() {
     fi
 
     # ── Lifecycle: stop sandbox when CLI exits ───────────────────────────
-    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; exit 0" EXIT HUP TERM
-    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; exit 0" INT
+    trap "stty echo 2>/dev/null; echo ''; info 'Stopping sandbox...'; container stop '$name' 2>/dev/null || true; msg 'Sandbox stopped.'; trap - EXIT HUP TERM INT" EXIT HUP TERM INT
 
     # ── Interactive launch ───────────────────────────────────────────────
     echo ""
@@ -1181,15 +1180,6 @@ _foreground_wait() {
     done
 
     # Container stopped on its own — EXIT trap handles cleanup
-    exit 0
-}
-
-_foreground_stop() {
-    local name="$1"
-    echo ""
-    info "Stopping sandbox '$name'..."
-    container stop "$name" 2>/dev/null || true
-    msg "Sandbox '$name' stopped."
     exit 0
 }
 
